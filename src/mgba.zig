@@ -121,6 +121,19 @@ pub const Emulator = struct {
     /// Purely a debugging aid: nothing above this file reads pixels.
     stream: ?Stream = null,
 
+    /// Optional speed limit. Without one the emulator runs as fast as it can,
+    /// which is about forty times real time and unwatchable.
+    pace: ?Pace = null,
+
+    pub const Pace = struct {
+        io: std.Io,
+        per_frame: std.Io.Duration,
+        /// When the next frame is due. Kept as a deadline rather than a sleep
+        /// per frame so the time spent emulating and encoding is absorbed
+        /// instead of added on top.
+        due: ?std.Io.Timestamp = null,
+    };
+
     pub const Stream = struct {
         io: std.Io,
         dir: std.Io.Dir,
@@ -182,10 +195,41 @@ pub const Emulator = struct {
         self.core.reset.?(self.core);
     }
 
+    /// Run at `multiple` times real speed; 1.0 is a Game Boy Advance's own
+    /// 59.7fps. Pass null to remove the limit.
+    pub fn setSpeed(self: *Emulator, io: std.Io, multiple: ?f64) void {
+        const m = multiple orelse {
+            self.pace = null;
+            return;
+        };
+        if (m <= 0) {
+            self.pace = null;
+            return;
+        }
+        // The GBA runs at 59.7275 frames per second.
+        const ns: i96 = @intFromFloat(1_000_000_000.0 / (59.7275 * m));
+        self.pace = .{ .io = io, .per_frame = .fromNanoseconds(ns) };
+    }
+
+    fn waitForFrameDeadline(self: *Emulator) void {
+        const p = &(self.pace orelse return);
+        const now = std.Io.Timestamp.now(p.io, .awake);
+        const due = p.due orelse now;
+        const remaining = now.durationTo(due);
+        if (remaining.nanoseconds > 0) {
+            std.Io.sleep(p.io, remaining, .awake) catch {};
+        }
+        // If we fell behind, start counting again from now rather than trying
+        // to catch up in a burst.
+        const base = if (remaining.nanoseconds > 0) due else now;
+        p.due = base.addDuration(p.per_frame);
+    }
+
     pub fn runFrames(self: *Emulator, n: u32) void {
         var i: u32 = 0;
         while (i < n) : (i += 1) {
             self.core.runFrame.?(self.core);
+            self.waitForFrameDeadline();
             if (self.stream) |*st| {
                 st.counter += 1;
                 if (st.counter >= st.every) {
@@ -307,9 +351,12 @@ pub const Emulator = struct {
             for (0..screen_width) |x| {
                 const px = src[y * stride + x];
                 const i = (y * screen_width + x) * 4;
-                out[i + 0] = @truncate(px >> 16);
+                // mGBA's 32-bit pixels are 0xAABBGGRR: red is the low byte,
+                // see M_COLOR_RED in mgba-util/image.h. Reading it the other
+                // way round swaps red and blue, which turns water orange.
+                out[i + 0] = @truncate(px);
                 out[i + 1] = @truncate(px >> 8);
-                out[i + 2] = @truncate(px);
+                out[i + 2] = @truncate(px >> 16);
                 out[i + 3] = 0xFF;
             }
         }

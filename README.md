@@ -51,6 +51,8 @@ so dialogue arrives as `PROF. OAK: Hello there!` rather than bytes.
 | `advance_text` | Press through a conversation, returning everything that was said |
 | `party` | The party, at any time |
 | `save_state` / `load_state` | Snapshot and rewind, for trying something reversible |
+| `enter_name` | Type on a naming screen: the player, the rival, a nickname |
+| `say` | Speak in the game's own message box, in your own colour |
 | `read_memory` / `find_symbol` | Escape hatch, by address or by symbol name |
 
 ## Setup
@@ -75,6 +77,43 @@ Then:
 ```
 
 It speaks JSON-RPC over stdio. Point an MCP client at that command.
+
+## Watching it play
+
+Unthrottled the emulator runs about forty times faster than a Game Boy, which
+is useless to watch. `--realtime` paces it to the real 59.7fps, and `--stream`
+drops each frame in a directory with a page to view it:
+
+```bash
+./zig-out/bin/pokemcp --rom pokefirered.gba --realtime --stream /tmp/pokemcp
+```
+
+Serve that directory with any static file server and open `index.html`.
+
+`--speed 4` and the like sit in between, for skipping the parts nobody wants to
+watch.
+
+## Talking to the audience
+
+`say` puts text in the game's own message box:
+
+```
+say  "Route 1 next.\nI need a Potion first."
+```
+
+It is a real message, not something drawn over the picture: the tool assembles
+four bytecode instructions in the RAM the game reserves for link scripts,
+points the idle script context at them, and the engine runs it on the next
+frame. The game draws the box, in its own font and window.
+
+It comes out red on pale blue rather than the usual dark grey on white, so
+viewers can tell your voice from the game's; `color` and `background` change
+that. The colour rides along in the message as one of the game's own text
+control codes, so nothing has to be restored afterwards and ordinary dialogue
+is untouched.
+
+It only works standing in the overworld with nothing else happening, since
+interrupting a script the game is already running would strand it.
 
 ## What is not in this repository
 
@@ -127,6 +166,14 @@ tiles, but most are arrival points that never fire. The terrain type says which
 ones work and how: a door opens when you step on it, an arrow tile or a
 staircase needs one more press in the direction it points. `observe` reports
 that as the `trigger` field.
+
+**Naming is done by writing, not typing.** `enter_name` puts the name straight
+into the naming screen's buffer instead of walking its on-screen keyboard,
+which would be dozens of presses and depends on the cursor starting where you
+expect. The game copies that buffer to its destination when the name is
+confirmed, so the result is what it would have been by hand. The screen's own
+character limit is respected: a name too long for it is refused rather than
+allowed to overflow into the save data behind it.
 
 **Moving verifies itself.** `move` holds the d-pad until the position actually
 changes rather than for a fixed number of frames, because a step takes longer

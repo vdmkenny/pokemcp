@@ -179,6 +179,37 @@ const tools = [_]Tool{
         .handler = toolLoadState,
     },
     .{
+        .name = "enter_name",
+        .description =
+            \\Type a name on a naming screen: the player, the rival, or a Pokemon
+            \\nickname. Only works while such a screen is up; `observe` shows one as
+            \\CB2_NamingScreen. Letters, digits and the punctuation the game has
+            \\glyphs for; anything else is refused rather than quietly changed. Names
+            \\longer than the screen accepts are refused too, rather than overflowing
+            \\into the save data behind it.
+        ,
+        .schema = "{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\",\"description\":\"the name to enter\"}},\"required\":[\"name\"]}",
+        .handler = toolEnterName,
+    },
+    .{
+        .name = "say",
+        .description =
+            \\Say something in the game's own message box, so anyone watching sees it
+            \\in the game's font and window rather than as an overlay. Use it to
+            \\narrate what you are doing and why.
+            \\
+            \\Only works standing in the overworld with nothing else happening: it
+            \\hands the game a script, and interrupting one already running would
+            \\strand it. Two lines of about 17 characters fit; use \\n between them.
+            \\Press A afterwards to dismiss the box, as with any message.
+            \\
+            \\Coloured differently from the game's own dialogue by default, red on
+            \\pale blue, so viewers can tell your voice from the game's.
+        ,
+        .schema = "{\"type\":\"object\",\"properties\":{\"text\":{\"type\":\"string\",\"description\":\"what to say; \\\\n splits the two lines\"},\"color\":{\"type\":\"string\",\"description\":\"text colour: red, blue, green, white, gray, or a light_ variant\"},\"background\":{\"type\":\"string\",\"description\":\"background colour behind the text\"}},\"required\":[\"text\"]}",
+        .handler = toolSay,
+    },
+    .{
         .name = "read_memory",
         .description =
             \\Read raw bytes, by address or by symbol name from the disassembly.
@@ -364,6 +395,66 @@ fn toolReadMemory(session: *Session, args: Args, gpa: Allocator, out: *Json) Too
         .address = try std.fmt.allocPrint(gpa, "0x{x:0>8}", .{addr}),
         .length = length,
         .hex = hex,
+    });
+}
+
+fn toolEnterName(session: *Session, args: Args, gpa: Allocator, out: *Json) ToolError!void {
+    const wanted = args.string("name") orelse return error.BadArgument;
+    const info = session.game.namingScreen() orelse {
+        try out.write(.{
+            .entered = false,
+            .@"error" = "no naming screen is open",
+            .screen = try session.game.screen(gpa),
+        });
+        return;
+    };
+    const max = session.game.typeName(wanted) catch |err| {
+        try out.write(.{
+            .entered = false,
+            .@"error" = switch (err) {
+                error.NameTooLong => "too long for this screen",
+                error.UnsupportedCharacter => "the game has no glyph for one of those characters",
+                else => @errorName(err),
+            },
+            .max_chars = info.max_chars,
+        });
+        return;
+    };
+    try out.write(.{
+        .entered = true,
+        .name = wanted,
+        .max_chars = max,
+        .screen = try session.game.screen(gpa),
+    });
+}
+
+fn toolSay(session: *Session, args: Args, gpa: Allocator, out: *Json) ToolError!void {
+    const line = args.string("text") orelse return error.BadArgument;
+    session.game.showMessage(
+        line,
+        args.string("color"),
+        args.string("background"),
+    ) catch |err| {
+        try out.write(.{
+            .shown = false,
+            .@"error" = switch (err) {
+                error.ScriptAlreadyRunning => "something is already happening; wait for it to finish",
+                error.NotInOverworld, error.NoSaveBlock => "only works in the overworld",
+                error.MessageTooLong => "too long for a message box",
+                error.UnsupportedCharacter => "the game has no glyph for one of those characters",
+                error.NotSupportedByThisGame => "this game's adapter cannot show messages",
+                error.UnknownColor => "unknown colour; try red, blue, green, white, " ++
+                    "gray, or the light_ variants",
+            },
+        });
+        return;
+    };
+    // Give the engine a moment to pick the script up and draw the box.
+    session.game.wait(30);
+    try out.write(.{
+        .shown = true,
+        .text = line,
+        .dialog = try session.game.dialog(gpa),
     });
 }
 

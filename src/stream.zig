@@ -66,21 +66,26 @@ pub fn writeBmp(
 pub const index_html =
     \\<!doctype html><meta charset="utf-8"><title>pokemcp</title>
     \\<style>
-    \\  body{margin:0;background:#14161a;color:#c8ccd4;font:13px ui-monospace,monospace;
-    \\       display:flex;flex-direction:column;align-items:center;justify-content:center;
-    \\       height:100vh;gap:14px}
-    \\  img{width:min(96vw,720px);image-rendering:pixelated;border-radius:6px;
-    \\      box-shadow:0 8px 40px #0008}
-    \\  .bar{opacity:.65;letter-spacing:.04em}
+    \\  body{margin:0;background:#101216;color:#c8ccd4;
+    \\       font:13px ui-monospace,SFMono-Regular,Menlo,monospace;
+    \\       display:flex;flex-direction:column;align-items:center;
+    \\       justify-content:center;height:100vh;gap:12px}
+    \\  img{width:min(94vw,720px);height:auto;display:block;
+    \\      image-rendering:pixelated;border-radius:4px;
+    \\      box-shadow:0 10px 50px #0009}
+    \\  .bar{opacity:.5;letter-spacing:.05em;font-size:12px}
     \\</style>
     \\<img id="s" alt="game screen">
-    \\<div class="bar">pokemcp &middot; live view &middot; <span id="n">0</span> frames</div>
+    \\<div class="bar">pokemcp &middot; <span id="n">0</span> frames</div>
     \\<script>
     \\  let n = 0;
-    \\  const img = document.getElementById('s'), counter = document.getElementById('n');
+    \\  const img = document.getElementById('s');
+    \\  const counter = document.getElementById('n');
     \\  function tick() {
     \\    const next = new Image();
-    \\    next.onload = () => { img.src = next.src; counter.textContent = ++n; setTimeout(tick, 80); };
+    \\    next.onload = () => {
+    \\      img.src = next.src; counter.textContent = ++n; setTimeout(tick, 70);
+    \\    };
     \\    next.onerror = () => setTimeout(tick, 300);
     \\    next.src = 'frame.bmp?t=' + Date.now();
     \\  }

@@ -141,6 +141,45 @@ pub fn decodeAlloc(
     return buf.toOwnedSlice();
 }
 
+/// Encode UTF-8 into the game's character set.
+///
+/// The reverse of `decode`, used to type a name straight into a naming
+/// screen's buffer. Characters the game has no glyph for are refused rather
+/// than silently replaced: a name is the player's, and quietly changing it
+/// would be worse than saying it cannot be typed.
+pub fn encode(
+    out: []u8,
+    text: []const u8,
+    charmap: *const [256][]const u8,
+) error{ NameTooLong, UnsupportedCharacter }![]u8 {
+    var written: usize = 0;
+    var i: usize = 0;
+    while (i < text.len) {
+        // The charmap holds UTF-8, so match the longest glyph first: a
+        // multi-byte character must not be mistaken for its first byte.
+        var matched = false;
+        var best_len: usize = 0;
+        var best_byte: u8 = 0;
+        for (charmap, 0..) |glyph, byte| {
+            if (glyph.len == 0 or glyph.len > text.len - i) continue;
+            if (!std.mem.eql(u8, glyph, text[i..][0..glyph.len])) continue;
+            if (glyph.len > best_len) {
+                best_len = glyph.len;
+                best_byte = @intCast(byte);
+                matched = true;
+            }
+        }
+        if (!matched) return error.UnsupportedCharacter;
+        if (written >= out.len) return error.NameTooLong;
+        out[written] = best_byte;
+        written += 1;
+        i += best_len;
+    }
+    if (written >= out.len) return error.NameTooLong;
+    out[written] = @intFromEnum(Control.end);
+    return out[0 .. written + 1];
+}
+
 /// Decode a name-shaped string: single line, surrounding space removed.
 /// Names and menu entries carry padding that is an artifact of the text box.
 pub fn decodeName(
@@ -198,6 +237,25 @@ test "extended control codes are skipped with their arguments" {
     );
     defer std.testing.allocator.free(out);
     try std.testing.expectEqualStrings("AB", out);
+}
+
+test "encode is the inverse of decode" {
+    const cm = testCharmap();
+    var buf: [16]u8 = undefined;
+    const bytes = try encode(&buf, "AB A", &cm);
+    try std.testing.expectEqualSlices(u8, &.{ 0xBB, 0xBC, 0x00, 0xBB, 0xFF }, bytes);
+
+    const back = try decodeAlloc(std.testing.allocator, bytes, &cm, .{});
+    defer std.testing.allocator.free(back);
+    try std.testing.expectEqualStrings("AB A", back);
+}
+
+test "encode refuses what the game cannot show" {
+    const cm = testCharmap();
+    var buf: [16]u8 = undefined;
+    try std.testing.expectError(error.UnsupportedCharacter, encode(&buf, "Z", &cm));
+    var tiny: [3]u8 = undefined;
+    try std.testing.expectError(error.NameTooLong, encode(&tiny, "AAAA", &cm));
 }
 
 test "placeholders use the runtime value when there is one" {

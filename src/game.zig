@@ -146,6 +146,73 @@ pub const Game = union(enum) {
             inline else => |*g| g.visibleSigns(gpa),
         };
     }
+    pub const Naming = struct { max_chars: u8 };
+
+    /// The open naming screen, if there is one.
+    pub fn namingScreen(self: *Game) ?Naming {
+        return switch (self.*) {
+            inline else => |*g| if (g.namingScreen()) |n|
+                Naming{ .max_chars = n.max_chars }
+            else
+                null,
+        };
+    }
+
+    /// Type a name into the open naming screen and confirm it.
+    pub fn typeName(self: *Game, wanted: []const u8) !u8 {
+        const max = switch (self.*) {
+            inline else => |*g| try g.writeName(wanted),
+        };
+        // START is the naming screen's OK button. It takes a moment to accept
+        // the name and fade out, and how long varies, so wait for the screen
+        // to actually go rather than guessing a frame count.
+        self.press(.{ .start = true }, 6, 30);
+        var waited: u32 = 0;
+        while (waited < 360) : (waited += 20) {
+            self.wait(20);
+            if (self.namingScreen() == null) break;
+        }
+        return max;
+    }
+
+    /// Show text in the game's own message box, where the adapter supports
+    /// it. Optional on purpose: it needs a script engine, which not every
+    /// generation drives the same way, so an adapter without it simply says
+    /// so rather than every adapter having to provide one.
+    /// Stated rather than inferred: with one adapter implementing this the
+    /// compiler would never see the unsupported branch, and adding a second
+    /// game would silently change the error set callers handle.
+    pub const MessageError = error{
+        NotInOverworld,
+        ScriptAlreadyRunning,
+        MessageTooLong,
+        UnsupportedCharacter,
+        NoSaveBlock,
+        NotSupportedByThisGame,
+        UnknownColor,
+    };
+
+    /// Colour names an adapter understands, or null for its default.
+    pub fn showMessage(
+        self: *Game,
+        message: []const u8,
+        color: ?[]const u8,
+        background: ?[]const u8,
+    ) MessageError!void {
+        return switch (self.*) {
+            inline else => |*g| blk: {
+                const G = @TypeOf(g.*);
+                if (!@hasDecl(G, "showMessage")) break :blk error.NotSupportedByThisGame;
+                var palette: G.Palette = .{};
+                if (color) |c| palette.text = G.TextColor.parse(c) orelse
+                    break :blk error.UnknownColor;
+                if (background) |c| palette.background = G.TextColor.parse(c) orelse
+                    break :blk error.UnknownColor;
+                break :blk g.showMessage(message, palette);
+            },
+        };
+    }
+
     pub fn inputLocked(self: *Game) bool {
         return switch (self.*) {
             inline else => |*g| g.inputLocked(),

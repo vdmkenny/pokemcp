@@ -19,6 +19,8 @@ const usage =
     \\  --data <path>   generated game table (default: data/firered.dat)
     \\  --save <path>   battery save file to attach (.sav)
     \\  --boot <n>      frames to run before serving (default: 0)
+    \\  --realtime      run at true Game Boy speed, for watching
+    \\  --speed <mult>  run at this multiple of real speed (1 = realtime)
     \\  --stream <dir>  write the screen there as frame.bmp, with an index.html
     \\                  to watch it in a browser (for humans; the agent reads memory)
     \\  --help          this message
@@ -34,6 +36,7 @@ const Options = struct {
     save: ?[]const u8 = null,
     boot: u32 = 0,
     stream: ?[]const u8 = null,
+    speed: ?f64 = null,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -65,6 +68,11 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, a, "--stream") and i + 1 < args.len) {
             i += 1;
             opts.stream = args[i];
+        } else if (std.mem.eql(u8, a, "--speed") and i + 1 < args.len) {
+            i += 1;
+            opts.speed = std.fmt.parseFloat(f64, args[i]) catch null;
+        } else if (std.mem.eql(u8, a, "--realtime")) {
+            opts.speed = 1.0;
         } else if (std.mem.eql(u8, a, "--boot") and i + 1 < args.len) {
             i += 1;
             opts.boot = std.fmt.parseInt(u32, args[i], 10) catch 0;
@@ -121,6 +129,12 @@ pub fn main(init: std.process.Init) !void {
         try err.flush();
     }
 
+    if (opts.speed) |mult| {
+        emu.setSpeed(io, mult);
+        try err.print("speed: {d}x real time\n", .{mult});
+        try err.flush();
+    }
+
     if (opts.boot > 0) emu.runFrames(opts.boot);
 
     try err.print(
@@ -129,7 +143,12 @@ pub fn main(init: std.process.Init) !void {
     );
     try err.flush();
 
-    var session: mcp.Session = .{ .gpa = gpa, .game = &game, .data = &data, .io = io };
+    var session: mcp.Session = .{
+        .gpa = gpa,
+        .game = &game,
+        .data = &data,
+        .io = io,
+    };
     defer session.deinit();
 
     var in_buf: [64 * 1024]u8 = undefined;

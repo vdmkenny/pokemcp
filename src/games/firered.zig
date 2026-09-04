@@ -112,6 +112,11 @@ const Symbols = struct {
     player_party: u32,
     player_party_count: u32,
     lock_field_controls: u32,
+    naming_screen: u32,
+    script_context: u32,
+    script_status: u32,
+    cmd_table: u32,
+    cmd_table_end: u32,
     string_vars: [3]u32,
     string_var4: u32,
     displayed_string_battle: u32,
@@ -148,6 +153,11 @@ const Symbols = struct {
             .player_party = try need(data, "gPlayerParty"),
             .player_party_count = try need(data, "gPlayerPartyCount"),
             .lock_field_controls = try need(data, "sLockFieldControls"),
+            .naming_screen = try need(data, "sNamingScreen"),
+            .script_context = try need(data, "sGlobalScriptContext"),
+            .script_status = try need(data, "sGlobalScriptContextStatus"),
+            .cmd_table = try need(data, "gScriptCmdTable"),
+            .cmd_table_end = try need(data, "gScriptCmdTableEnd"),
             .string_vars = .{
                 try need(data, "gStringVar1"),
                 try need(data, "gStringVar2"),
@@ -880,6 +890,229 @@ pub const FireRed = struct {
             .move_cursor = move_cursor,
             .moves = try moves.toOwnedSlice(gpa),
         };
+    }
+
+
+    // -- naming screen -------------------------------------------------------
+
+    /// struct NamingScreenData, from src/naming_screen.c.
+    const naming = struct {
+        const text_buffer = 0x1800;
+        const template_ptr = 0x1E28;
+        /// struct NamingScreenTemplate: maxChars is the second byte.
+        const template_max_chars = 1;
+    };
+
+    pub const Naming = struct {
+        /// How many characters this particular screen will accept. Writing
+        /// more would run past the buffer the game copies into.
+        max_chars: u8,
+    };
+
+    /// The naming screen, if one is open.
+    pub fn namingScreen(self: *FireRed) ?Naming {
+        const ptr = self.emu.read32(self.sym.naming_screen);
+        if (ptr == 0) return null;
+        const template = self.emu.read32(ptr + naming.template_ptr);
+        if (template == 0) return null;
+        const max = self.emu.read8(template + naming.template_max_chars);
+        if (max == 0 or max > 16) return null;
+        return .{ .max_chars = max };
+    }
+
+    /// Type a name into the open naming screen.
+    ///
+    /// Writes straight into the screen's own text buffer rather than walking
+    /// its on-screen keyboard, which would be dozens of button presses and
+    /// depends on the cursor starting where you expect. The game copies this
+    /// buffer to its destination when the name is confirmed, so the result is
+    /// exactly what it would be if a person had typed it.
+    pub fn writeName(self: *FireRed, wanted: []const u8) !u8 {
+        const screen_info = self.namingScreen() orelse return error.NoNamingScreen;
+
+        var encoded: [17]u8 = undefined;
+        const bytes = text.encode(encoded[0 .. screen_info.max_chars + 1], wanted, &self.data.charmap) catch |e|
+            switch (e) {
+                error.NameTooLong => return error.NameTooLong,
+                error.UnsupportedCharacter => return error.UnsupportedCharacter,
+            };
+
+        const ptr = self.emu.read32(self.sym.naming_screen);
+        // Clear the buffer first: a shorter name must not leave the tail of a
+        // longer one behind it.
+        var blank: [0x10]u8 = @splat(@intFromEnum(text.Control.end));
+        self.emu.writeBytes(ptr + naming.text_buffer, &blank);
+        self.emu.writeBytes(ptr + naming.text_buffer, bytes);
+        return screen_info.max_chars;
+    }
+
+
+    // -- putting a message on screen -----------------------------------------
+
+    /// Script bytecode, from asm/macros/event.inc.
+    const ScriptOp = enum(u8) {
+        end = 0x02,
+        callstd = 0x09,
+        loadword = 0x0F,
+        lockall = 0x69,
+        releaseall = 0x6B,
+    };
+
+    /// callstd argument for an ordinary message box.
+    const msgbox_default = 4;
+
+    /// Text colours the game understands (include/characters.h).
+    pub const TextColor = enum(u8) {
+        transparent = 0x0,
+        white = 0x1,
+        dark_gray = 0x2,
+        light_gray = 0x3,
+        red = 0x4,
+        light_red = 0x5,
+        green = 0x6,
+        light_green = 0x7,
+        blue = 0x8,
+        light_blue = 0x9,
+        _,
+
+        pub fn parse(s_: []const u8) ?TextColor {
+            const table = .{
+                .{ "white", TextColor.white },       .{ "gray", TextColor.dark_gray },
+                .{ "grey", TextColor.dark_gray },    .{ "light_gray", TextColor.light_gray },
+                .{ "red", TextColor.red },           .{ "light_red", TextColor.light_red },
+                .{ "green", TextColor.green },       .{ "light_green", TextColor.light_green },
+                .{ "blue", TextColor.blue },         .{ "light_blue", TextColor.light_blue },
+            };
+            inline for (table) |e| {
+                if (std.ascii.eqlIgnoreCase(s_, e[0])) return e[1];
+            }
+            return null;
+        }
+    };
+
+    /// How the AI's own messages are coloured, so they are obviously not the
+    /// game talking. Red on a pale blue field, rather than the usual dark grey
+    /// on white.
+    pub const Palette = struct {
+        text: TextColor = .red,
+        background: TextColor = .light_blue,
+        shadow: TextColor = .light_gray,
+    };
+
+    /// struct ScriptContext, from include/script.h.
+    const script_ctx = struct {
+        const stack_depth = 0x00;
+        const mode = 0x01;
+        const script_ptr = 0x08;
+        const cmd_table = 0x5C;
+        const cmd_table_end = 0x60;
+        const mode_bytecode = 1;
+        const status_running = 0;
+    };
+
+    /// SaveBlock1.ramScript: a kilobyte the game reserves for a script
+    /// delivered over link, and never uses in ordinary play. Borrowing it
+    /// avoids picking an address something else owns, and is safe across a
+    /// save: the game checks this buffer's checksum before ever running it,
+    /// and the checksum and header bytes ahead of the body are left alone, so
+    /// what we write here stays inert as far as the game is concerned.
+    const ram_script = 0x361C;
+    const ram_script_body = ram_script + 4 + 4;
+
+    pub const MessageError = error{
+        NotInOverworld,
+        ScriptAlreadyRunning,
+        MessageTooLong,
+        UnsupportedCharacter,
+        NoSaveBlock,
+    };
+
+    /// Show text in a real message box, by handing the game a script.
+    ///
+    /// The box is the game's own: this assembles four bytecode instructions in
+    /// the RAM the game keeps for link scripts, points the idle script context
+    /// at them, and lets the engine run it on the next frame. What appears is
+    /// a genuine field message, drawn by the game with its own font and
+    /// window, not something painted over the picture afterwards.
+    ///
+    /// Only works standing in the overworld with nothing else going on;
+    /// interrupting a running script would strand it half-finished.
+    pub fn showMessage(self: *FireRed, message: []const u8, palette: Palette) MessageError!void {
+        if (self.inputLocked()) return error.ScriptAlreadyRunning;
+        if (self.emu.read8(self.sym.script_status) == script_ctx.status_running)
+            return error.ScriptAlreadyRunning;
+
+        const b1 = self.saveBlock1();
+        if (b1 == 0) return error.NoSaveBlock;
+
+        // Encode first: a message the font cannot render should change nothing.
+        //
+        // The colour goes in the message itself as an EXT_CTRL_CODE, rather
+        // than by repainting the window, so nothing has to be put back
+        // afterwards and the game's own dialogue keeps its usual look.
+        var encoded: [256]u8 = undefined;
+        encoded[0] = @intFromEnum(text.Control.ext);
+        encoded[1] = 0x04; // EXT_CTRL_CODE_COLOR_HIGHLIGHT_SHADOW
+        encoded[2] = @intFromEnum(palette.text);
+        encoded[3] = @intFromEnum(palette.background);
+        encoded[4] = @intFromEnum(palette.shadow);
+        const body = encodeMessage(encoded[5..], message, &self.data.charmap) catch |e| return switch (e) {
+            error.NameTooLong => error.MessageTooLong,
+            error.UnsupportedCharacter => error.UnsupportedCharacter,
+        };
+        const text_bytes = encoded[0 .. 5 + body.len];
+
+        const script_addr = b1 + ram_script_body;
+        const text_addr = script_addr + 16;
+
+        var code: [11]u8 = undefined;
+        code[0] = @intFromEnum(ScriptOp.lockall);
+        code[1] = @intFromEnum(ScriptOp.loadword);
+        code[2] = 0; // destination slot 0, where callstd looks for the text
+        std.mem.writeInt(u32, code[3..7], text_addr, .little);
+        code[7] = @intFromEnum(ScriptOp.callstd);
+        code[8] = msgbox_default;
+        code[9] = @intFromEnum(ScriptOp.releaseall);
+        code[10] = @intFromEnum(ScriptOp.end);
+
+        self.emu.writeBytes(script_addr, &code);
+        self.emu.writeBytes(text_addr, text_bytes);
+
+        // Point the idle context at it and start it.
+        const ctx = self.sym.script_context;
+        self.emu.write8(ctx + script_ctx.stack_depth, 0);
+        self.emu.write8(ctx + script_ctx.mode, script_ctx.mode_bytecode);
+        self.emu.write32(ctx + script_ctx.script_ptr, script_addr);
+        self.emu.write32(ctx + script_ctx.cmd_table, self.sym.cmd_table);
+        self.emu.write32(ctx + script_ctx.cmd_table_end, self.sym.cmd_table_end);
+        self.emu.write8(self.sym.script_status, script_ctx.status_running);
+    }
+
+    /// Like text.encode, but newlines become the game's line break so a
+    /// message can use both lines of the box.
+    fn encodeMessage(
+        out: []u8,
+        message: []const u8,
+        charmap: *const [256][]const u8,
+    ) error{ NameTooLong, UnsupportedCharacter }![]u8 {
+        var written: usize = 0;
+        var lines = std.mem.splitScalar(u8, message, '\n');
+        var first = true;
+        while (lines.next()) |line| {
+            if (!first) {
+                if (written >= out.len) return error.NameTooLong;
+                out[written] = 0xFE; // CHAR_NEWLINE
+                written += 1;
+            }
+            first = false;
+            const encoded = try text.encode(out[written..], line, charmap);
+            // encode terminates the slice; keep the characters, drop the
+            // terminator so the next line can follow.
+            written += encoded.len - 1;
+        }
+        if (written >= out.len) return error.NameTooLong;
+        out[written] = 0xFF; // EOS
+        return out[0 .. written + 1];
     }
 
     // -- helpers -------------------------------------------------------------
