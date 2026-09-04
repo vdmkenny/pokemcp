@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const stream_mod = @import("stream.zig");
 
 pub const c = @cImport({
     @cInclude("mgba/core/core.h");
@@ -116,6 +117,19 @@ pub const Emulator = struct {
     video: []align(@alignOf(u32)) u8,
     gpa: Allocator,
 
+    /// Optional live view for a human watching. Set by `startStreaming`.
+    /// Purely a debugging aid: nothing above this file reads pixels.
+    stream: ?Stream = null,
+
+    pub const Stream = struct {
+        io: std.Io,
+        dir: std.Io.Dir,
+        /// Write one frame in this many, so a fast-forwarding agent does not
+        /// spend all its time encoding images.
+        every: u32,
+        counter: u32 = 0,
+    };
+
     pub fn init(gpa: Allocator, rom_path: []const u8) !Emulator {
         c.mLogSetDefaultLogger(&quiet_logger);
 
@@ -170,7 +184,36 @@ pub const Emulator = struct {
 
     pub fn runFrames(self: *Emulator, n: u32) void {
         var i: u32 = 0;
-        while (i < n) : (i += 1) self.core.runFrame.?(self.core);
+        while (i < n) : (i += 1) {
+            self.core.runFrame.?(self.core);
+            if (self.stream) |*st| {
+                st.counter += 1;
+                if (st.counter >= st.every) {
+                    st.counter = 0;
+                    // A dropped frame is not worth interrupting play for.
+                    self.writeStreamFrame() catch {};
+                }
+            }
+        }
+    }
+
+    /// Start dropping frames into `dir` for a human to watch.
+    pub fn startStreaming(self: *Emulator, io: std.Io, dir: std.Io.Dir, every: u32) void {
+        self.stream = .{ .io = io, .dir = dir, .every = @max(every, 1) };
+    }
+
+    fn writeStreamFrame(self: *Emulator) !void {
+        const st = self.stream orelse return;
+        var pixels: [screen_width * screen_height * 4]u8 = undefined;
+        try self.screenshotRgba(&pixels);
+
+        var buf: [screen_width * screen_height * 3 + 64]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        try stream_mod.writeBmp(&w, &pixels, screen_width, screen_height);
+
+        // Write then rename, so a reader never gets half a frame.
+        try st.dir.writeFile(st.io, .{ .sub_path = "frame.tmp", .data = w.buffered() });
+        try st.dir.rename("frame.tmp", st.dir, "frame.bmp", st.io);
     }
 
     pub fn frame(self: *Emulator) u32 {

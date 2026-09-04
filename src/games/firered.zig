@@ -109,6 +109,9 @@ const Symbols = struct {
     map_header: u32,
     object_events: u32,
     vmap: u32,
+    player_party: u32,
+    player_party_count: u32,
+    lock_field_controls: u32,
     string_vars: [3]u32,
     string_var4: u32,
     displayed_string_battle: u32,
@@ -142,6 +145,9 @@ const Symbols = struct {
             .map_header = try need(data, "gMapHeader"),
             .object_events = try need(data, "gObjectEvents"),
             .vmap = try need(data, "VMap"),
+            .player_party = try need(data, "gPlayerParty"),
+            .player_party_count = try need(data, "gPlayerPartyCount"),
+            .lock_field_controls = try need(data, "sLockFieldControls"),
             .string_vars = .{
                 try need(data, "gStringVar1"),
                 try need(data, "gStringVar2"),
@@ -280,6 +286,7 @@ pub const FireRed = struct {
             .mode = classify(cb2, in_battle),
             .in_battle = in_battle,
             .fade_active = self.fadeActive(),
+            .input_locked = self.inputLocked(),
         };
     }
 
@@ -289,6 +296,16 @@ pub const FireRed = struct {
             return std.fmt.allocPrint(gpa, "{s}+0x{x}", .{ sym.name, (addr & ~@as(u32, 1)) - sym.addr });
         }
         return std.fmt.allocPrint(gpa, "0x{x:0>8}", .{addr});
+    }
+
+    /// True while a cutscene or a script owns the player.
+    ///
+    /// Walking, turning and talking all do nothing in this state, so an agent
+    /// that does not know about it reads a blocked step as a wall and starts
+    /// trying other directions. The answer is to wait, or press A if the
+    /// script is waiting on a message.
+    pub fn inputLocked(self: *FireRed) bool {
+        return self.emu.read8(self.sym.lock_field_controls) != 0;
     }
 
     /// Most input is ignored while the screen is fading.
@@ -340,12 +357,10 @@ pub const FireRed = struct {
             (self.emu.read8(self.sym.main + s.main_in_battle_offset) & s.main_in_battle_mask) != 0;
         const source = if (in_battle) self.sym.displayed_string_battle else self.sym.string_var4;
 
-        var raw: [1024]u8 = undefined;
-        self.emu.readBytes(source, &raw);
-        const decoded = try text.decodeAlloc(gpa, &raw, &self.data.charmap, opts);
-        const trimmed = std.mem.trim(u8, decoded, " \n\t");
-        if (trimmed.len == 0) return null;
-
+        // The message buffers keep their contents after a box closes, so the
+        // text printers decide whether anything is actually on screen. Without
+        // this check an agent reads the last thing said as though it were
+        // still displayed, and waits forever for a box that is already gone.
         var box_open = false;
         var printing = false;
         var i: u32 = 0;
@@ -359,7 +374,15 @@ pub const FireRed = struct {
             // State 0 is "still typing"; 6 is "finished, waiting".
             if (p.state != 0 and p.state != 6) printing = true;
         }
-        return .{ .text = trimmed, .box_open = box_open, .still_printing = printing };
+        if (!box_open) return null;
+
+        var raw: [1024]u8 = undefined;
+        self.emu.readBytes(source, &raw);
+        const decoded = try text.decodeAlloc(gpa, &raw, &self.data.charmap, opts);
+        const trimmed = std.mem.trim(u8, decoded, " \n\t");
+        if (trimmed.len == 0) return null;
+
+        return .{ .text = trimmed, .box_open = true, .still_printing = printing };
     }
 
     // -- the world -----------------------------------------------------------
@@ -672,15 +695,20 @@ pub const FireRed = struct {
         return list.toOwnedSlice(gpa);
     }
 
+    /// The party the player is actually carrying.
+    ///
+    /// Not the copy inside the save block: that one is only refreshed when the
+    /// game saves (see CopyPartyToSaveBlock in src/load_save.c), so reading it
+    /// reports an empty party right after catching something.
     pub fn party(self: *FireRed, gpa: Allocator) ![]obs.Mon {
-        const b1 = self.saveBlock1();
         var list: std.ArrayList(obs.Mon) = .empty;
-        if (b1 == 0) return list.toOwnedSlice(gpa);
-
-        const count = @min(self.emu.read8(b1 + sb1.party_count), s.party_size);
+        const count = @min(self.emu.read8(self.sym.player_party_count), s.party_size);
         var i: u32 = 0;
         while (i < count) : (i += 1) {
-            const mon = self.emu.readStruct(s.Pokemon, b1 + sb1.party + i * @sizeOf(s.Pokemon));
+            const mon = self.emu.readStruct(
+                s.Pokemon,
+                self.sym.player_party + i * @sizeOf(s.Pokemon),
+            );
             const secure = pk.unpack(mon.box);
             if (pk.isEmpty(mon, secure)) continue;
 

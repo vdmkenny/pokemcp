@@ -28,6 +28,9 @@ pub const Screen = struct {
     in_battle: bool,
     /// While the screen is fading, input is ignored.
     fade_active: bool,
+    /// A cutscene or script owns the player: walking and talking do nothing
+    /// until it finishes. Wait, or press A if it is waiting on a message.
+    input_locked: bool,
 };
 
 pub const Move = struct {

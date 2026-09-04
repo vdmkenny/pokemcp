@@ -8,6 +8,7 @@ const mgba = @import("mgba.zig");
 const gamedata = @import("gamedata.zig");
 const game_mod = @import("game.zig");
 const mcp = @import("mcp.zig");
+const stream = @import("stream.zig");
 
 const usage =
     \\pokemcp -- MCP server for playing Pokemon through emulator memory
@@ -18,6 +19,8 @@ const usage =
     \\  --data <path>   generated game table (default: data/firered.dat)
     \\  --save <path>   battery save file to attach (.sav)
     \\  --boot <n>      frames to run before serving (default: 0)
+    \\  --stream <dir>  write the screen there as frame.bmp, with an index.html
+    \\                  to watch it in a browser (for humans; the agent reads memory)
     \\  --help          this message
     \\
     \\The game table is produced from a built disassembly with
@@ -30,6 +33,7 @@ const Options = struct {
     data: []const u8 = "data/firered.dat",
     save: ?[]const u8 = null,
     boot: u32 = 0,
+    stream: ?[]const u8 = null,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -58,6 +62,9 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, a, "--save") and i + 1 < args.len) {
             i += 1;
             opts.save = args[i];
+        } else if (std.mem.eql(u8, a, "--stream") and i + 1 < args.len) {
+            i += 1;
+            opts.stream = args[i];
         } else if (std.mem.eql(u8, a, "--boot") and i + 1 < args.len) {
             i += 1;
             opts.boot = std.fmt.parseInt(u32, args[i], 10) catch 0;
@@ -105,6 +112,15 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     };
 
+    if (opts.stream) |dir_path| {
+        std.Io.Dir.cwd().createDirPath(io, dir_path) catch {};
+        const dir = try std.Io.Dir.cwd().openDir(io, dir_path, .{});
+        try dir.writeFile(io, .{ .sub_path = "index.html", .data = stream.index_html });
+        emu.startStreaming(io, dir, 4);
+        try err.print("live view: {s}/index.html\n", .{dir_path});
+        try err.flush();
+    }
+
     if (opts.boot > 0) emu.runFrames(opts.boot);
 
     try err.print(
@@ -113,7 +129,7 @@ pub fn main(init: std.process.Init) !void {
     );
     try err.flush();
 
-    var session: mcp.Session = .{ .gpa = gpa, .game = &game, .data = &data };
+    var session: mcp.Session = .{ .gpa = gpa, .game = &game, .data = &data, .io = io };
     defer session.deinit();
 
     var in_buf: [64 * 1024]u8 = undefined;
@@ -136,4 +152,5 @@ test {
     _ = @import("games/pokemon.zig");
     _ = @import("games/firered.zig");
     _ = @import("mcp.zig");
+    _ = @import("stream.zig");
 }

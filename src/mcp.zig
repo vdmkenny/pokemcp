@@ -25,6 +25,7 @@ pub const Session = struct {
     gpa: Allocator,
     game: *Game,
     data: *const gamedata.GameData,
+    io: std.Io,
     states: [save_slots]?[]u8 = @splat(null),
 
     pub fn deinit(self: *Session) void {
@@ -165,15 +166,16 @@ const tools = [_]Tool{
     },
     .{
         .name = "save_state",
-        .description = "Snapshot the whole machine into a numbered slot, so an " ++
-            "experiment can be undone. Slots live for this session only.",
-        .schema = "{\"type\":\"object\",\"properties\":{\"slot\":{\"type\":\"integer\",\"minimum\":0,\"maximum\":7,\"default\":0}}}",
+        .description = "Snapshot the whole machine so an experiment can be undone. " ++
+            "Numbered slots last for this session; give a path to keep one on disk " ++
+            "and reload it in a later session.",
+        .schema = "{\"type\":\"object\",\"properties\":{\"slot\":{\"type\":\"integer\",\"minimum\":0,\"maximum\":7,\"default\":0},\"path\":{\"type\":\"string\",\"description\":\"write the snapshot here instead of a slot\"}}}",
         .handler = toolSaveState,
     },
     .{
         .name = "load_state",
-        .description = "Restore a snapshot taken with save_state.",
-        .schema = "{\"type\":\"object\",\"properties\":{\"slot\":{\"type\":\"integer\",\"minimum\":0,\"maximum\":7,\"default\":0}}}",
+        .description = "Restore a snapshot taken with save_state, from a slot or a path.",
+        .schema = "{\"type\":\"object\",\"properties\":{\"slot\":{\"type\":\"integer\",\"minimum\":0,\"maximum\":7,\"default\":0},\"path\":{\"type\":\"string\"}}}",
         .handler = toolLoadState,
     },
     .{
@@ -214,6 +216,7 @@ fn toolScreen(session: *Session, _: Args, gpa: Allocator, out: *Json) ToolError!
     }
     try out.write(.{
         .mode = @tagName(scr.mode),
+        .screen = scr,
         .location = try g.location(gpa),
         .viewport = g.viewport(),
         .view = try g.renderScreen(gpa),
@@ -292,16 +295,35 @@ fn toolParty(session: *Session, _: Args, gpa: Allocator, out: *Json) ToolError!v
 }
 
 fn toolSaveState(session: *Session, args: Args, gpa: Allocator, out: *Json) ToolError!void {
+    if (args.string("path")) |path| {
+        const blob = try session.game.emulator().saveState(gpa);
+        try std.Io.Dir.cwd().writeFile(session.io, .{ .sub_path = path, .data = blob });
+        try out.write(.{ .saved = true, .path = path, .bytes = blob.len });
+        return;
+    }
     const slot = args.uint("slot", 0);
     if (slot >= save_slots) return error.BadArgument;
     const blob = try session.game.emulator().saveState(session.gpa);
     if (session.states[slot]) |old| session.gpa.free(old);
     session.states[slot] = blob;
-    _ = gpa;
     try out.write(.{ .saved = true, .slot = slot, .bytes = blob.len });
 }
 
 fn toolLoadState(session: *Session, args: Args, gpa: Allocator, out: *Json) ToolError!void {
+    if (args.string("path")) |path| {
+        const blob = std.Io.Dir.cwd().readFileAlloc(
+            session.io,
+            path,
+            gpa,
+            .limited(16 << 20),
+        ) catch {
+            try out.write(.{ .loaded = false, .path = path, .@"error" = "cannot read that file" });
+            return;
+        };
+        try session.game.emulator().loadState(blob);
+        try out.write(.{ .loaded = true, .path = path, .screen = try session.game.screen(gpa) });
+        return;
+    }
     const slot = args.uint("slot", 0);
     if (slot >= save_slots) return error.BadArgument;
     const blob = session.states[slot] orelse {

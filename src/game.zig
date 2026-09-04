@@ -146,6 +146,12 @@ pub const Game = union(enum) {
             inline else => |*g| g.visibleSigns(gpa),
         };
     }
+    pub fn inputLocked(self: *Game) bool {
+        return switch (self.*) {
+            inline else => |*g| g.inputLocked(),
+        };
+    }
+
     pub fn facing(self: *Game) Direction {
         return switch (self.*) {
             inline else => |*g| g.facing(),
@@ -234,7 +240,7 @@ pub const Game = union(enum) {
             .to = .{ .x = end.x, .y = end.y },
             .frames = elapsed,
             .warped = warped,
-            .blocked_by = if (moved) null else try self.blocker(gpa),
+            .blocked_by = if (moved) null else try self.blocker(gpa, dir),
         };
     }
 
@@ -253,19 +259,31 @@ pub const Game = union(enum) {
     }
 
     /// The best available explanation for a step that did not happen.
-    fn blocker(self: *Game, gpa: Allocator) !?[]const u8 {
+    ///
+    /// Judged on the tile in the direction that was actually tried, not the
+    /// one the player happens to be facing. A blocked step often leaves the
+    /// facing unchanged, so using it would blame whatever is in front of the
+    /// player for every direction alike.
+    fn blocker(self: *Game, gpa: Allocator, dir: Direction) !?[]const u8 {
+        // A script that owns the player blocks every direction equally, so
+        // check it before blaming the scenery.
+        if (self.inputLocked()) return "script_running";
         if (try self.dialog(gpa)) |d| {
             if (d.box_open) return "dialog_open";
         }
-        const ahead = self.tileAhead() orelse return "unknown";
+
+        const w = self.where();
+        const d = dir.delta();
+        const target = self.tileAt(w.x + d.x, w.y + d.y);
+
         const npcs = try self.visibleNpcs(gpa);
         for (npcs) |n| {
-            if (n.x == ahead.x and n.y == ahead.y) return n.kind;
+            if (n.x == target.x and n.y == target.y) return n.kind;
         }
-        if (std.mem.indexOf(u8, ahead.behavior, "WATER") != null) return "water";
-        if (std.mem.indexOf(u8, ahead.behavior, "JUMP") != null or
-            std.mem.indexOf(u8, ahead.behavior, "LEDGE") != null) return "ledge_wrong_way";
-        if (!ahead.passable) return "wall";
+        if (std.mem.indexOf(u8, target.behavior, "WATER") != null) return "water";
+        if (std.mem.indexOf(u8, target.behavior, "JUMP") != null or
+            std.mem.indexOf(u8, target.behavior, "LEDGE") != null) return "ledge_wrong_way";
+        if (!target.passable) return "wall";
         return "unknown";
     }
 
@@ -307,28 +325,32 @@ pub const Game = union(enum) {
         box_open: bool,
     };
 
-    /// Press A until the text box closes or stops changing, collecting
-    /// everything that was said so a conversation is still readable.
+    /// Press A until the text box closes, collecting everything that was said
+    /// so a conversation is still readable afterwards.
+    ///
+    /// Does nothing when no box is open: this advances text, it does not start
+    /// a conversation. Mashing A at an empty overworld would walk into signs
+    /// and talk to whoever happened to be standing there.
     pub fn advanceText(self: *Game, gpa: Allocator, max_presses: u32) !TextResult {
         var seen: std.ArrayList([]const u8) = .empty;
+        if (try self.dialog(gpa) == null) {
+            return .{ .messages = &.{}, .box_open = false };
+        }
+
         var i: u32 = 0;
-        var open = false;
         while (i < max_presses) : (i += 1) {
             const d = try self.dialog(gpa);
-            open = if (d) |dd| dd.box_open else false;
             if (d) |dd| {
                 const last = if (seen.items.len > 0) seen.items[seen.items.len - 1] else "";
                 if (dd.text.len != 0 and !std.mem.eql(u8, last, dd.text)) {
                     try seen.append(gpa, dd.text);
                 }
-            }
-            if (!open and seen.items.len > 0) break;
+            } else break;
             self.press(.{ .a = true }, 4, 12);
         }
-        const final = try self.dialog(gpa);
         return .{
             .messages = try seen.toOwnedSlice(gpa),
-            .box_open = if (final) |f| f.box_open else false,
+            .box_open = try self.dialog(gpa) != null,
         };
     }
 
