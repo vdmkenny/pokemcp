@@ -109,6 +109,24 @@ fn logNothing(
     _ = .{ logger, category, level, format, args };
 }
 
+/// A small spin lock, because `std.Io.Mutex` wants an `Io` handed to every
+/// lock call and that would have to be threaded through every memory read.
+/// The emulation thread holds this for the length of one frame, well under a
+/// millisecond, and readers hardly ever collide with it.
+const Lock = struct {
+    held: std.atomic.Value(bool) = .init(false),
+
+    fn lock(l: *Lock) void {
+        while (l.held.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {
+            std.Thread.yield() catch {};
+        }
+    }
+
+    fn unlock(l: *Lock) void {
+        l.held.store(false, .release);
+    }
+};
+
 pub const screen_width = 240;
 pub const screen_height = 160;
 
@@ -124,6 +142,26 @@ pub const Emulator = struct {
     /// Optional speed limit. Without one the emulator runs as fast as it can,
     /// which is about forty times real time and unwatchable.
     pace: ?Pace = null,
+
+    /// Guards the core. Held for the length of one frame by the thread that
+    /// is running the game, and by anyone reading or writing memory.
+    lock: Lock = .{},
+
+    /// Set when the game is running on its own thread. The point is that the
+    /// world does not stop between an agent's decisions: NPCs keep walking,
+    /// animations keep playing, and anyone watching sees a game rather than a
+    /// slideshow. Buttons become something held for a while and then let go,
+    /// which is what a controller actually does.
+    freewheel: ?*Freewheel = null,
+
+    pub const Freewheel = struct {
+        thread: std.Thread,
+        /// Buttons the pad is holding right now.
+        held: Buttons = .none,
+        /// Frame at which to let go of them; 0 means they are not held.
+        release_at: u32 = 0,
+        stop: bool = false,
+    };
 
     pub const Pace = struct {
         io: std.Io,
@@ -225,19 +263,27 @@ pub const Emulator = struct {
         p.due = base.addDuration(p.per_frame);
     }
 
+    /// Let `n` frames go by.
+    ///
+    /// When the game has a thread of its own this waits for it to get there
+    /// rather than stepping it, so callers never stall the world.
     pub fn runFrames(self: *Emulator, n: u32) void {
+        if (self.freewheel != null) {
+            const target = self.frameCounter() +% n;
+            while (true) {
+                const now = self.frameCounter();
+                if (now -% target < 0x8000_0000) return;
+                std.Thread.yield() catch {};
+                if (self.pace) |p| std.Io.sleep(p.io, .fromMilliseconds(2), .awake) catch {};
+            }
+        }
         var i: u32 = 0;
         while (i < n) : (i += 1) {
+            self.lock.lock();
             self.core.runFrame.?(self.core);
+            self.streamTick();
+            self.lock.unlock();
             self.waitForFrameDeadline();
-            if (self.stream) |*st| {
-                st.counter += 1;
-                if (st.counter >= st.every) {
-                    st.counter = 0;
-                    // A dropped frame is not worth interrupting play for.
-                    self.writeStreamFrame() catch {};
-                }
-            }
         }
     }
 
@@ -261,36 +307,141 @@ pub const Emulator = struct {
     }
 
     pub fn frame(self: *Emulator) u32 {
-        return self.core.frameCounter.?(self.core);
+        return self.frameCounter();
     }
 
+    /// Press buttons. While the game runs on its own thread this records what
+    /// the pad is holding; the thread applies it every frame until released.
     pub fn setButtons(self: *Emulator, buttons: Buttons) void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        if (self.freewheel) |fw| {
+            fw.held = buttons;
+            fw.release_at = 0;
+        }
         self.core.setKeys.?(self.core, buttons.mask());
+    }
+
+    /// Hold buttons for a number of frames, then let go, without blocking.
+    pub fn holdButtons(self: *Emulator, buttons: Buttons, frames: u32) void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        self.core.setKeys.?(self.core, buttons.mask());
+        if (self.freewheel) |fw| {
+            fw.held = buttons;
+            fw.release_at = self.core.frameCounter.?(self.core) +% @max(frames, 1);
+        }
+    }
+
+    /// Hand the game to a thread of its own, so it keeps running between
+    /// calls. Everything else goes through the lock from then on.
+    pub fn startFreewheel(self: *Emulator, gpa: Allocator) !void {
+        if (self.freewheel != null) return;
+        const fw = try gpa.create(Freewheel);
+        fw.* = .{ .thread = undefined };
+        self.freewheel = fw;
+        fw.thread = try std.Thread.spawn(.{}, freewheelLoop, .{self});
+    }
+
+    pub fn stopFreewheel(self: *Emulator, gpa: Allocator) void {
+        const fw = self.freewheel orelse return;
+        self.lock.lock();
+        fw.stop = true;
+        self.lock.unlock();
+        fw.thread.join();
+        self.freewheel = null;
+        gpa.destroy(fw);
+    }
+
+    fn freewheelLoop(self: *Emulator) void {
+        while (true) {
+            self.lock.lock();
+            const fw = self.freewheel orelse {
+                self.lock.unlock();
+                return;
+            };
+            if (fw.stop) {
+                self.lock.unlock();
+                return;
+            }
+            const frame_now = self.core.frameCounter.?(self.core);
+            // Let go of anything whose hold has expired, so a press behaves
+            // like a press and not a stuck key.
+            if (fw.release_at != 0 and frame_now >= fw.release_at) {
+                fw.held = .none;
+                fw.release_at = 0;
+            }
+            self.core.setKeys.?(self.core, fw.held.mask());
+            self.core.runFrame.?(self.core);
+            self.streamTick();
+            self.lock.unlock();
+
+            self.waitForFrameDeadline();
+        }
+    }
+
+    fn streamTick(self: *Emulator) void {
+        const st = &(self.stream orelse return);
+        st.counter += 1;
+        if (st.counter >= st.every) {
+            st.counter = 0;
+            self.writeStreamFrame() catch {};
+        }
+    }
+
+    pub fn frameCounter(self: *Emulator) u32 {
+        self.lock.lock();
+        defer self.lock.unlock();
+        return self.core.frameCounter.?(self.core);
     }
 
     // -- memory --------------------------------------------------------------
 
+    // The public accessors take the lock; the raw ones assume the caller
+    // already holds it. Keeping them apart is what stops a bulk read from
+    // trying to lock once per byte.
+
     pub fn read8(self: *Emulator, addr: u32) u8 {
-        return @truncate(self.core.busRead8.?(self.core, addr));
+        self.lock.lock();
+        defer self.lock.unlock();
+        return self.rawRead8(addr);
     }
 
     pub fn read16(self: *Emulator, addr: u32) u16 {
+        self.lock.lock();
+        defer self.lock.unlock();
         return @truncate(self.core.busRead16.?(self.core, addr));
     }
 
     pub fn read32(self: *Emulator, addr: u32) u32 {
+        self.lock.lock();
+        defer self.lock.unlock();
+        return self.rawRead32(addr);
+    }
+
+    fn rawRead8(self: *Emulator, addr: u32) u8 {
+        return @truncate(self.core.busRead8.?(self.core, addr));
+    }
+
+    fn rawRead32(self: *Emulator, addr: u32) u32 {
         return self.core.busRead32.?(self.core, addr);
     }
 
     pub fn write8(self: *Emulator, addr: u32, value: u8) void {
+        self.lock.lock();
+        defer self.lock.unlock();
         self.core.busWrite8.?(self.core, addr, value);
     }
 
     pub fn write16(self: *Emulator, addr: u32, value: u16) void {
+        self.lock.lock();
+        defer self.lock.unlock();
         self.core.busWrite16.?(self.core, addr, value);
     }
 
     pub fn write32(self: *Emulator, addr: u32, value: u32) void {
+        self.lock.lock();
+        defer self.lock.unlock();
         self.core.busWrite32.?(self.core, addr, value);
     }
 
@@ -298,20 +449,24 @@ pub const Emulator = struct {
     /// thousands of bytes, and a call per byte is what makes naive harnesses
     /// slow, so read words wherever alignment allows.
     pub fn readBytes(self: *Emulator, addr: u32, out: []u8) void {
+        self.lock.lock();
+        defer self.lock.unlock();
         var i: usize = 0;
         while (i < out.len and (addr +% @as(u32, @intCast(i))) % 4 != 0) : (i += 1) {
-            out[i] = self.read8(addr +% @as(u32, @intCast(i)));
+            out[i] = self.rawRead8(addr +% @as(u32, @intCast(i)));
         }
         while (i + 4 <= out.len) : (i += 4) {
-            std.mem.writeInt(u32, out[i..][0..4], self.read32(addr +% @as(u32, @intCast(i))), .little);
+            std.mem.writeInt(u32, out[i..][0..4], self.rawRead32(addr +% @as(u32, @intCast(i))), .little);
         }
         while (i < out.len) : (i += 1) {
-            out[i] = self.read8(addr +% @as(u32, @intCast(i)));
+            out[i] = self.rawRead8(addr +% @as(u32, @intCast(i)));
         }
     }
 
     pub fn writeBytes(self: *Emulator, addr: u32, data: []const u8) void {
-        for (data, 0..) |b, i| self.write8(addr +% @as(u32, @intCast(i)), b);
+        self.lock.lock();
+        defer self.lock.unlock();
+        for (data, 0..) |b, i| self.core.busWrite8.?(self.core, addr +% @as(u32, @intCast(i)), b);
     }
 
     /// Read a game structure straight into its Zig declaration.
@@ -329,6 +484,8 @@ pub const Emulator = struct {
     // -- savestates ----------------------------------------------------------
 
     pub fn saveState(self: *Emulator, gpa: Allocator) ![]u8 {
+        self.lock.lock();
+        defer self.lock.unlock();
         const size = self.core.stateSize.?(self.core);
         const buf = try gpa.alloc(u8, size);
         errdefer gpa.free(buf);
@@ -337,6 +494,8 @@ pub const Emulator = struct {
     }
 
     pub fn loadState(self: *Emulator, blob: []const u8) !void {
+        self.lock.lock();
+        defer self.lock.unlock();
         if (!self.core.loadState.?(self.core, blob.ptr)) return error.LoadStateFailed;
     }
 

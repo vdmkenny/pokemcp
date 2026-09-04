@@ -131,9 +131,17 @@ pub fn main(init: std.process.Init) !void {
 
     if (opts.speed) |mult| {
         emu.setSpeed(io, mult);
-        try err.print("speed: {d}x real time\n", .{mult});
+        // A speed limit means somebody is watching, so hand the game its own
+        // thread: it keeps running between calls instead of freezing on every
+        // decision, and viewers see a game rather than a slideshow. Without a
+        // limit the emulator steps only when asked, which is faster and
+        // reproducible -- better for tests and for working through a long
+        // stretch quickly.
+        try emu.startFreewheel(gpa);
+        try err.print("speed: {d}x real time, game running continuously\n", .{mult});
         try err.flush();
     }
+    defer emu.stopFreewheel(gpa);
 
     if (opts.boot > 0) emu.runFrames(opts.boot);
 

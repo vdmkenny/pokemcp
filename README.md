@@ -93,6 +93,13 @@ Serve that directory with any static file server and open `index.html`.
 `--speed 4` and the like sit in between, for skipping the parts nobody wants to
 watch.
 
+Setting a speed also hands the game its own thread, so it keeps running between
+tool calls rather than freezing on every decision. NPCs keep walking, water
+keeps animating, and a button press is something held for a while and then let
+go, the way a controller works. Without a speed limit the emulator steps only
+when asked, which is faster and reproducible: better for tests, and for getting
+through a long stretch quickly.
+
 ## Talking to the audience
 
 `say` puts text in the game's own message box:
