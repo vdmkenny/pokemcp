@@ -1,0 +1,8 @@
+.{
+    .name = .pokemcp,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.16.0",
+    .fingerprint = 0x3466e29cfee864d1,
+    .dependencies = .{},
+    .paths = .{ "build.zig", "build.zig.zon", "src", "tools" },
+}

@@ -1,0 +1,23 @@
+# Third-party sources, fetched by scripts/setup.sh.
+/vendor/
+
+# Build output: libmgba, the Zig cache, and the compiled server.
+/build/
+/zig-out/
+/.zig-cache/
+
+# Generated from a disassembly on the machine that builds the ROM.
+# Derived from the game's own data, so it is never committed.
+/data/
+
+# Game ROMs and saves are never part of this repository.
+*.gba
+*.gb
+*.gbc
+*.sav
+*.sa1
+*.ss[0-9]
+*.state
+
+# macOS
+.DS_Store
