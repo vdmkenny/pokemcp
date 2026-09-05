@@ -61,6 +61,33 @@ pub fn writeBmp(
     }
 }
 
+/// Write 16-bit PCM as a WAV. Short chunks of this are what the page stitches
+/// back together to get sound; WAV because it needs no encoder and every
+/// browser can decode it.
+pub fn writeWav(
+    out: *std.Io.Writer,
+    samples: []const i16,
+    rate: u32,
+    channels: u16,
+) std.Io.Writer.Error!void {
+    const data_bytes: u32 = @intCast(samples.len * 2);
+    const byte_rate = rate * channels * 2;
+
+    try out.writeAll("RIFF");
+    try out.writeInt(u32, 36 + data_bytes, .little);
+    try out.writeAll("WAVEfmt ");
+    try out.writeInt(u32, 16, .little); // PCM header length
+    try out.writeInt(u16, 1, .little); // uncompressed
+    try out.writeInt(u16, channels, .little);
+    try out.writeInt(u32, rate, .little);
+    try out.writeInt(u32, byte_rate, .little);
+    try out.writeInt(u16, channels * 2, .little); // block align
+    try out.writeInt(u16, 16, .little); // bits per sample
+    try out.writeAll("data");
+    try out.writeInt(u32, data_bytes, .little);
+    for (samples) |s| try out.writeInt(i16, s, .little);
+}
+
 /// The page the browser polls. Scaled up and pixellated, because the real
 /// thing is 240x160.
 pub const index_html =
@@ -73,10 +100,15 @@ pub const index_html =
     \\  img{width:min(94vw,720px);height:auto;display:block;
     \\      image-rendering:pixelated;border-radius:4px;
     \\      box-shadow:0 10px 50px #0009}
-    \\  .bar{opacity:.5;letter-spacing:.05em;font-size:12px}
+    \\  .bar{opacity:.5;letter-spacing:.05em;font-size:12px;
+    \\       display:flex;gap:10px;align-items:center}
+    \\  button{font:inherit;color:inherit;background:#232734;border:1px solid #3a4051;
+    \\         border-radius:4px;padding:2px 8px;cursor:pointer}
+    \\  button:hover{background:#2c3242}
     \\</style>
     \\<img id="s" alt="game screen">
-    \\<div class="bar">pokemcp &middot; <span id="n">0</span> frames</div>
+    \\<div class="bar">pokemcp &middot; <span id="n">0</span> frames
+    \\  <button id="snd">enable sound</button></div>
     \\<script>
     \\  let n = 0;
     \\  const img = document.getElementById('s');
@@ -90,6 +122,44 @@ pub const index_html =
     \\    next.src = 'frame.bmp?t=' + Date.now();
     \\  }
     \\  tick();
+    \\
+    \\  // Sound arrives as a run of short WAVs. Play them back to back, and if
+    \\  // we ever fall behind the window kept on disk, jump to the live edge
+    \\  // rather than trying to catch up through stale audio.
+    \\  const btn = document.getElementById('snd');
+    \\  let ctx = null, want = -1, playAt = 0, busy = false;
+    \\  btn.onclick = async () => {
+    \\    if (ctx) { await ctx.close(); ctx = null; want = -1; btn.textContent = 'enable sound'; return; }
+    \\    ctx = new (window.AudioContext || window.webkitAudioContext)();
+    \\    await ctx.resume();
+    \\    btn.textContent = 'mute';
+    \\  };
+    \\  async function pump() {
+    \\    if (ctx && !busy) {
+    \\      busy = true;
+    \\      try {
+    \\        const m = await (await fetch('audio.json?t=' + Date.now(), {cache:'no-store'})).json();
+    \\        if (want < 0 || want < m.first) { want = m.latest; playAt = 0; }
+    \\        while (want <= m.latest) {
+    \\          const r = await fetch('a' + want + '.wav', {cache:'no-store'});
+    \\          if (!r.ok) break;
+    \\          const buf = await ctx.decodeAudioData(await r.arrayBuffer());
+    \\          const src = ctx.createBufferSource();
+    \\          src.buffer = buf; src.connect(ctx.destination);
+    \\          if (playAt < ctx.currentTime + 0.05) playAt = ctx.currentTime + 0.2;
+    \\          src.start(playAt);
+    \\          playAt += buf.duration;
+    \\          want++;
+    \\        }
+    \\        // If the queue has crept ahead of the picture, drop what is left
+    \\        // and rejoin at the live edge rather than drifting further.
+    \\        if (playAt - ctx.currentTime > 1.2) { want = m.latest + 1; playAt = 0; }
+    \\      } catch (e) {}
+    \\      busy = false;
+    \\    }
+    \\    setTimeout(pump, 120);
+    \\  }
+    \\  pump();
     \\</script>
 ;
 

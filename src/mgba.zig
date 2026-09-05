@@ -14,6 +14,7 @@ pub const c = @cImport({
     @cInclude("mgba/core/config.h");
     @cInclude("mgba/core/log.h");
     @cInclude("mgba-util/vfs.h");
+    @cInclude("mgba-util/audio-buffer.h");
 });
 
 pub const Error = error{
@@ -139,6 +140,9 @@ pub const Emulator = struct {
     /// Purely a debugging aid: nothing above this file reads pixels.
     stream: ?Stream = null,
 
+    /// Optional sound capture for that same viewer. Set by `startAudio`.
+    audio: ?Audio = null,
+
     /// Optional speed limit. Without one the emulator runs as fast as it can,
     /// which is about forty times real time and unwatchable.
     pace: ?Pace = null,
@@ -170,6 +174,24 @@ pub const Emulator = struct {
         /// per frame so the time spent emulating and encoding is absorbed
         /// instead of added on top.
         due: ?std.Io.Timestamp = null,
+    };
+
+    /// Stereo, which is what the hardware produces and the page expects.
+    const channels: u16 = 2;
+
+    /// How many chunks stay on disk. Enough for a viewer to be a little behind,
+    /// few enough that the directory does not grow without bound.
+    const keep_chunks: u32 = 24;
+
+    pub const Audio = struct {
+        io: std.Io,
+        dir: std.Io.Dir,
+        rate: u32,
+        /// Interleaved stereo, waiting to reach a chunk's worth.
+        pending: std.ArrayList(i16) = .empty,
+        /// Frames per chunk.
+        per_chunk: usize,
+        chunk: u32 = 0,
     };
 
     pub const Stream = struct {
@@ -207,6 +229,13 @@ pub const Emulator = struct {
         // so a reset lands somewhere deterministic.
         c.mCoreConfigSetIntValue(&core.*.config, "skipBios", 1);
         c.mCoreConfigSetIntValue(&core.*.config, "useBios", 0);
+        // Loading the config copies the volume out of `core.opts` and over the
+        // audio's own default, so a zero there mutes the game outright. The
+        // values have to be mapped into `opts` first; setting them on the
+        // config alone is not enough. 0x100 is GBA_AUDIO_VOLUME_MAX.
+        c.mCoreConfigSetIntValue(&core.*.config, "volume", 0x100);
+        c.mCoreConfigSetIntValue(&core.*.config, "mute", 0);
+        c.mCoreConfigMap(&core.*.config, &core.*.opts);
         core.*.loadConfig.?(core, &core.*.config);
 
         if (!c.mCoreLoadFile(core, path_z.ptr)) return error.RomLoadFailed;
@@ -216,6 +245,7 @@ pub const Emulator = struct {
     }
 
     pub fn deinit(self: *Emulator) void {
+        if (self.audio) |*au| au.pending.deinit(self.gpa);
         self.core.deinit.?(self.core);
         self.gpa.free(self.video);
         self.* = undefined;
@@ -290,6 +320,84 @@ pub const Emulator = struct {
     /// Start dropping frames into `dir` for a human to watch.
     pub fn startStreaming(self: *Emulator, io: std.Io, dir: std.Io.Dir, every: u32) void {
         self.stream = .{ .io = io, .dir = dir, .every = @max(every, 1) };
+    }
+
+    /// Also send the sound there, as a run of short WAV chunks the page can
+    /// stitch back together. The core keeps its own audio buffer; nothing has
+    /// been draining it, so this both captures the sound and stops it filling.
+    pub fn startAudio(self: *Emulator, io: std.Io, dir: std.Io.Dir) void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        const rate = self.core.audioSampleRate.?(self.core);
+        // Room for well over a frame's worth, so nothing is lost between drains.
+        self.core.setAudioBufferSize.?(self.core, 4096);
+        self.audio = .{
+            .io = io,
+            .dir = dir,
+            .rate = rate,
+            // A fifth of a second per chunk: short enough to stay close to the
+            // picture, long enough that the page is not fetching constantly.
+            .per_chunk = rate / 5,
+        };
+    }
+
+    /// Take whatever the core has produced and, once there is a chunk's worth,
+    /// write it out. Called once per frame with the lock already held.
+    fn audioTick(self: *Emulator) !void {
+        const au = &(self.audio orelse return);
+        const buffer = self.core.getAudioBuffer.?(self.core);
+
+        // The rate is not fixed: it follows the sound hardware's resolution,
+        // which a game sets for itself after boot. FireRed doubles it. Reading
+        // it fresh keeps each chunk honest about how fast to play; caching the
+        // value from startup makes everything come out at twice the speed.
+        const rate = self.core.audioSampleRate.?(self.core);
+        if (rate != 0) {
+            au.rate = rate;
+            au.per_chunk = @max(rate / 5, 1);
+        }
+
+        var scratch: [2048 * channels]i16 = undefined;
+        while (true) {
+            const available = c.mAudioBufferAvailable(buffer);
+            if (available == 0) break;
+            const want = @min(available, scratch.len / channels);
+            const got = c.mAudioBufferRead(buffer, &scratch, want);
+            if (got == 0) break;
+            try au.pending.appendSlice(self.gpa, scratch[0 .. got * channels]);
+        }
+
+        if (au.pending.items.len < au.per_chunk * channels) return;
+
+        var body: std.Io.Writer.Allocating = .init(self.gpa);
+        defer body.deinit();
+        try stream_mod.writeWav(&body.writer, au.pending.items, au.rate, channels);
+        au.pending.clearRetainingCapacity();
+
+        var name: [32]u8 = undefined;
+        const chunk = try std.fmt.bufPrint(&name, "a{d}.wav", .{au.chunk});
+        try au.dir.writeFile(au.io, .{ .sub_path = "a.tmp", .data = body.written() });
+        try au.dir.rename("a.tmp", au.dir, chunk, au.io);
+
+        // Say what exists, so the page knows what to fetch and can tell when it
+        // has fallen behind.
+        const first = au.chunk -| keep_chunks;
+        var manifest: [96]u8 = undefined;
+        const json = try std.fmt.bufPrint(
+            &manifest,
+            "{{\"rate\":{d},\"channels\":{d},\"first\":{d},\"latest\":{d}}}",
+            .{ au.rate, channels, first, au.chunk },
+        );
+        try au.dir.writeFile(au.io, .{ .sub_path = "m.tmp", .data = json });
+        try au.dir.rename("m.tmp", au.dir, "audio.json", au.io);
+
+        // Drop the chunk that just fell out of the window.
+        if (au.chunk >= keep_chunks) {
+            var old: [32]u8 = undefined;
+            const gone = try std.fmt.bufPrint(&old, "a{d}.wav", .{au.chunk - keep_chunks});
+            au.dir.deleteFile(au.io, gone) catch {};
+        }
+        au.chunk += 1;
     }
 
     fn writeStreamFrame(self: *Emulator) !void {
@@ -381,6 +489,10 @@ pub const Emulator = struct {
     }
 
     fn streamTick(self: *Emulator) void {
+        // Sound first: it has to be drained every frame, whatever the picture
+        // is doing, or the core's buffer overruns and it comes out broken.
+        self.audioTick() catch {};
+
         const st = &(self.stream orelse return);
         st.counter += 1;
         if (st.counter >= st.every) {

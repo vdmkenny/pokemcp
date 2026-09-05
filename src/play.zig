@@ -555,16 +555,18 @@ const Screen = struct {
         _ = it.next(); // method
         const path = it.next() orelse "/";
 
-        const sub = if (std.mem.eql(u8, path, "/") or std.mem.startsWith(u8, path, "/?"))
-            "index.html"
-        else if (std.mem.startsWith(u8, path, "/frame.bmp"))
-            "frame.bmp"
-        else
-            path[1..];
+        // Everything is cache-busted with a query string, which is not part of
+        // the file name.
+        const no_query = path[0 .. std.mem.indexOfScalar(u8, path, '?') orelse path.len];
+        const sub = if (no_query.len <= 1) "index.html" else no_query[1..];
         const ctype = if (std.mem.endsWith(u8, sub, ".html"))
             "text/html; charset=utf-8"
         else if (std.mem.endsWith(u8, sub, ".bmp"))
             "image/bmp"
+        else if (std.mem.endsWith(u8, sub, ".wav"))
+            "audio/wav"
+        else if (std.mem.endsWith(u8, sub, ".json"))
+            "application/json"
         else
             "application/octet-stream";
 

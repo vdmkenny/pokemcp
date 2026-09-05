@@ -125,6 +125,7 @@ pub fn main(init: std.process.Init) !void {
         const dir = try std.Io.Dir.cwd().openDir(io, dir_path, .{});
         try dir.writeFile(io, .{ .sub_path = "index.html", .data = stream.index_html });
         emu.startStreaming(io, dir, 4);
+        emu.startAudio(io, dir);
         try err.print("live view: {s}/index.html\n", .{dir_path});
         try err.flush();
     }

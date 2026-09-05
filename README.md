@@ -90,6 +90,13 @@ drops each frame in a directory with a page to view it:
 ```
 
 Serve that directory with any static file server and open `index.html`.
+(`pokemcp-play` below serves it for you.)
+
+The page has sound too, behind a button, because a browser will not start
+audio without being asked. The emulator's audio buffer is drained every frame
+and written out as a run of short WAVs, which the page stitches back together;
+if playback ever drifts ahead of the picture it rejoins at the live edge rather
+than falling further behind.
 
 `--speed 4` and the like sit in between, for skipping the parts nobody wants to
 watch.
