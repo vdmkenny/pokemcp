@@ -129,6 +129,9 @@ const Symbols = struct {
     battler_in_menu: u32,
     action_cursor: u32,
     move_cursor: u32,
+    controller_funcs: u32,
+    choose_action_fn: u32,
+    choose_move_fn: u32,
 
     start_menu_window: u32,
     start_menu_cursor: u32,
@@ -173,6 +176,9 @@ const Symbols = struct {
             .battler_in_menu = try need(data, "gBattlerInMenuId"),
             .action_cursor = try need(data, "gActionSelectionCursor"),
             .move_cursor = try need(data, "gMoveSelectionCursor"),
+            .controller_funcs = try need(data, "gBattlerControllerFuncs"),
+            .choose_action_fn = try need(data, "HandleInputChooseAction"),
+            .choose_move_fn = try need(data, "HandleInputChooseMove"),
             .start_menu_window = try need(data, "sStartMenuWindowId"),
             .start_menu_cursor = try need(data, "sStartMenuCursorPos"),
             .start_menu_order = try need(data, "sStartMenuOrder"),
@@ -285,8 +291,7 @@ pub const FireRed = struct {
 
     pub fn screen(self: *FireRed, gpa: Allocator) !obs.Screen {
         const main = self.emu.readStruct(s.Main, self.sym.main);
-        const in_battle =
-            (self.emu.read8(self.sym.main + s.main_in_battle_offset) & s.main_in_battle_mask) != 0;
+        const in_battle = self.inBattle();
 
         const cb2 = try self.symbolText(gpa, main.callback2);
         const cb1 = try self.symbolText(gpa, main.callback1);
@@ -300,10 +305,16 @@ pub const FireRed = struct {
         };
     }
 
+    /// Function pointers carry the Thumb bit; symbol addresses do not.
+    fn stripThumb(addr: u32) u32 {
+        return addr & ~@as(u32, 1);
+    }
+
     fn symbolText(self: *FireRed, gpa: Allocator, addr: u32) ![]const u8 {
         if (self.data.resolve(addr)) |sym| {
-            if (sym.addr == (addr & ~@as(u32, 1))) return gpa.dupe(u8, sym.name);
-            return std.fmt.allocPrint(gpa, "{s}+0x{x}", .{ sym.name, (addr & ~@as(u32, 1)) - sym.addr });
+            const target = stripThumb(addr);
+            if (sym.addr == target) return gpa.dupe(u8, sym.name);
+            return std.fmt.allocPrint(gpa, "{s}+0x{x}", .{ sym.name, target - sym.addr });
         }
         return std.fmt.allocPrint(gpa, "0x{x:0>8}", .{addr});
     }
@@ -363,8 +374,7 @@ pub const FireRed = struct {
         const subs = try self.substitutions(gpa);
         const opts: text.Options = .{ .subs = subs };
 
-        const in_battle =
-            (self.emu.read8(self.sym.main + s.main_in_battle_offset) & s.main_in_battle_mask) != 0;
+        const in_battle = self.inBattle();
         const source = if (in_battle) self.sym.displayed_string_battle else self.sym.string_var4;
 
         // The message buffers keep their contents after a box closes, so the
@@ -722,22 +732,8 @@ pub const FireRed = struct {
             const secure = pk.unpack(mon.box);
             if (pk.isEmpty(mon, secure)) continue;
 
-            var moves: std.ArrayList(obs.Move) = .empty;
-            for (secure.attacks.moves, secure.attacks.pp, 0..) |mid, pp, slot_i| {
-                _ = slot_i;
-                if (mid == 0) continue;
-                try moves.append(gpa, .{
-                    .name = try self.moveName(gpa, mid),
-                    .id = mid,
-                    .pp = pp,
-                });
-            }
-
-            var nick_buf: [32]u8 = undefined;
-            const nickname = try gpa.dupe(
-                u8,
-                text.decodeName(&nick_buf, &mon.box.nickname, &self.data.charmap),
-            );
+            const moves = try self.decodeMoves(gpa, &secure.attacks.moves, &secure.attacks.pp);
+            const nickname = try self.dupeName(gpa, &mon.box.nickname);
 
             try list.append(gpa, .{
                 .slot = @intCast(i),
@@ -749,7 +745,7 @@ pub const FireRed = struct {
                 .max_hp = mon.max_hp,
                 .hp_percent = percent(mon.hp, mon.max_hp),
                 .status = try statusNames(gpa, mon.status),
-                .moves = try moves.toOwnedSlice(gpa),
+                .moves = moves,
                 .held_item = if (secure.growth.held_item != 0)
                     try self.itemName(gpa, secure.growth.held_item)
                 else
@@ -766,8 +762,7 @@ pub const FireRed = struct {
     // -- battle --------------------------------------------------------------
 
     pub fn battle(self: *FireRed, gpa: Allocator) !?obs.Battle {
-        const in_battle =
-            (self.emu.read8(self.sym.main + s.main_in_battle_offset) & s.main_in_battle_mask) != 0;
+        const in_battle = self.inBattle();
         if (!in_battle) return null;
 
         const flags: s.BattleTypeFlags = @bitCast(self.emu.read32(self.sym.battle_type_flags));
@@ -782,13 +777,6 @@ pub const FireRed = struct {
             );
             if (b.species == 0) continue;
 
-            var moves: std.ArrayList(obs.Move) = .empty;
-            for (b.moves, b.pp) |mid, pp| {
-                if (mid == 0) continue;
-                try moves.append(gpa, .{ .name = try self.moveName(gpa, mid), .id = mid, .pp = pp });
-            }
-
-            var nick_buf: [32]u8 = undefined;
             const types = try gpa.alloc([]const u8, 2);
             types[0] = try self.typeName(gpa, b.type1);
             types[1] = try self.typeName(gpa, b.type2);
@@ -797,10 +785,7 @@ pub const FireRed = struct {
                 // Even battler slots are the player's side.
                 .side = if (i % 2 == 0) "player" else "opponent",
                 .species = try self.speciesName(gpa, b.species),
-                .nickname = try gpa.dupe(
-                    u8,
-                    text.decodeName(&nick_buf, &b.nickname, &self.data.charmap),
-                ),
+                .nickname = try self.dupeName(gpa, &b.nickname),
                 .level = b.level,
                 .hp = b.hp,
                 .max_hp = b.max_hp,
@@ -808,7 +793,7 @@ pub const FireRed = struct {
                 .status = try statusNames(gpa, b.status1),
                 .ability = try self.abilityName(gpa, b.ability),
                 .types = types,
-                .moves = try moves.toOwnedSlice(gpa),
+                .moves = try self.decodeMoves(gpa, &b.moves, &b.pp),
             });
         }
 
@@ -863,23 +848,17 @@ pub const FireRed = struct {
     }
 
     fn battleMenu(self: *FireRed, gpa: Allocator) !?obs.Menu {
-        const in_battle =
-            (self.emu.read8(self.sym.main + s.main_in_battle_offset) & s.main_in_battle_mask) != 0;
+        const in_battle = self.inBattle();
         if (!in_battle) return null;
 
-        const battler = self.emu.read8(self.sym.battler_in_menu) & 0x03;
-        const action = self.emu.read8(self.sym.action_cursor + battler) & 0x03;
-        const move_cursor = self.emu.read8(self.sym.move_cursor + battler) & 0x03;
+        const battler = self.menuBattler();
+        const action = self.emu.read8(self.sym.action_cursor + battler) & cursor_mask;
+        const move_cursor = self.emu.read8(self.sym.move_cursor + battler) & cursor_mask;
 
-        var moves: std.ArrayList(obs.Move) = .empty;
         const b = self.emu.readStruct(
             s.BattlePokemon,
-            self.sym.battle_mons + @as(u32, battler) * @sizeOf(s.BattlePokemon),
+            self.sym.battle_mons + battler * @sizeOf(s.BattlePokemon),
         );
-        for (b.moves, b.pp) |mid, pp| {
-            if (mid == 0) continue;
-            try moves.append(gpa, .{ .name = try self.moveName(gpa, mid), .id = mid, .pp = pp });
-        }
 
         const opts = try gpa.dupe([]const u8, &battle_actions);
         return .{
@@ -888,10 +867,72 @@ pub const FireRed = struct {
             .cursor = action,
             .selected = opts[action],
             .move_cursor = move_cursor,
-            .moves = try moves.toOwnedSlice(gpa),
+            .moves = try self.decodeMoves(gpa, &b.moves, &b.pp),
         };
     }
 
+    // -- battle actions ------------------------------------------------------
+
+    pub fn inBattle(self: *FireRed) bool {
+        return (self.emu.read8(self.sym.main + s.main_in_battle_offset) & s.main_in_battle_mask) != 0;
+    }
+
+    /// Turn parallel move-id and PP arrays into the observation's move list,
+    /// dropping the empty slots. Party mons, battle mons and the battle menu
+    /// all store moves the same way, so they all read them the same way.
+    fn decodeMoves(self: *FireRed, gpa: Allocator, ids: []const u16, pps: []const u8) ![]obs.Move {
+        var moves: std.ArrayList(obs.Move) = .empty;
+        for (ids, pps) |mid, pp| {
+            if (mid == 0) continue;
+            try moves.append(gpa, .{ .name = try self.moveName(gpa, mid), .id = mid, .pp = pp });
+        }
+        return moves.toOwnedSlice(gpa);
+    }
+
+    /// Decode a name field and hand back an owned copy. Names come out of the
+    /// game short, so one scratch buffer serves every caller.
+    fn dupeName(self: *FireRed, gpa: Allocator, raw: []const u8) ![]const u8 {
+        var buf: [64]u8 = undefined;
+        return gpa.dupe(u8, text.decodeName(&buf, raw, &self.data.charmap));
+    }
+
+    /// Battler ids and battle-menu cursors are all in 0..3.
+    const cursor_mask: u8 = 0x03;
+
+    /// The battler whose action menu is up. Cursor arrays are indexed by it.
+    fn menuBattler(self: *FireRed) u32 {
+        return self.emu.read8(self.sym.battler_in_menu) & cursor_mask;
+    }
+
+    /// Point the top-level battle menu at an action (0=FIGHT..3=RUN). The game
+    /// reads this the instant A is pressed, so writing it is the same as having
+    /// walked the cursor there, without the guesswork of a blind 2x2 grid.
+    pub fn setBattleAction(self: *FireRed, action: u8) void {
+        self.emu.write8(self.sym.action_cursor + self.menuBattler(), action & cursor_mask);
+    }
+
+    /// Point the move submenu at a slot (0..3), same trick as setBattleAction.
+    pub fn setBattleMoveSlot(self: *FireRed, slot: u8) void {
+        self.emu.write8(self.sym.move_cursor + self.menuBattler(), slot & cursor_mask);
+    }
+
+    /// The controller function for a battler is the game's own record of what
+    /// that battler's turn is waiting on -- the surest way to know a menu is
+    /// really taking input rather than a message still being read out. Stored
+    /// with the Thumb bit set, so compare with it masked off.
+    fn controllerFn(self: *FireRed) u32 {
+        return stripThumb(self.emu.read32(self.sym.controller_funcs + self.menuBattler() * 4));
+    }
+
+    /// The top-level battle menu (FIGHT/BAG/POKEMON/RUN) is awaiting a choice.
+    pub fn battleAwaitingAction(self: *FireRed) bool {
+        return self.inBattle() and self.controllerFn() == self.sym.choose_action_fn;
+    }
+
+    /// The move submenu is awaiting a choice.
+    pub fn battleAwaitingMove(self: *FireRed) bool {
+        return self.inBattle() and self.controllerFn() == self.sym.choose_move_fn;
+    }
 
     // -- naming screen -------------------------------------------------------
 

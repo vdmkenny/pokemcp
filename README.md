@@ -49,6 +49,7 @@ so dialogue arrives as `PROF. OAK: Hello there!` rather than bytes.
 | `press` | Any button combination, for menus and battles |
 | `wait` | Let animations and scripted scenes run |
 | `advance_text` | Press through a conversation, returning everything that was said |
+| `use_move` | In battle, use a move by name or number; plays the turn out and returns what happened |
 | `party` | The party, at any time |
 | `save_state` / `load_state` | Snapshot and rewind, for trying something reversible |
 | `enter_name` | Type on a naming screen: the player, the rival, a nickname |
@@ -99,6 +100,44 @@ keeps animating, and a button press is something held for a while and then let
 go, the way a controller works. Without a speed limit the emulator steps only
 when asked, which is faster and reproducible: better for tests, and for getting
 through a long stretch quickly.
+
+## Letting a model play it
+
+`pokemcp-play` is the other half: it starts the server, hands the tools to a
+model on [OpenRouter](https://openrouter.ai) as function calls, serves the
+screen, and runs the loop.
+
+```bash
+cp .env.example .env      # put your key in it
+zig build play
+```
+
+That is the whole thing. It opens the live screen in a browser and starts
+playing. The goal, the model and the key can each come from a flag, the
+environment, or `.env`, in that order:
+
+| | flag | variable |
+| --- | --- | --- |
+| goal | `--prompt` / `--prompt-file` | `POKEMCP_PROMPT` |
+| model | `--model` | `OPENROUTER_MODEL` |
+| key | `--key` | `OPENROUTER_API_KEY` |
+
+```bash
+./zig-out/bin/pokemcp-play --model openai/gpt-4o-mini \
+    --prompt "Get to Viridian City and catch something on the way."
+```
+
+`.env` is gitignored, so the key stays out of the repository and out of your
+shell history.
+
+The model is told it is a brand new trainer who has only just left home and
+knows almost nothing about the world, and to stay in character: no talk of
+tools or models, things happen to it. It puts its thoughts on screen with
+`say`, so what you are watching is a nervous rookie thinking out loud rather
+than a program narrating itself. It is also told to read what people tell it
+rather than mashing through, and to pick real names when the game asks for one.
+
+It never sees a picture. The screen in your browser is for you.
 
 ## Talking to the audience
 
@@ -186,6 +225,25 @@ allowed to overflow into the save data behind it.
 changes rather than for a fixed number of frames, because a step takes longer
 on stairs or while the game is busy. A step that does not move you is a result,
 not an error: it is how you find a wall, a ledge, or an NPC in the way.
+
+**Battle moves are chosen by name.** Picking a move by hand means opening FIGHT
+and walking a 2x2 grid with no reliable read of where the cursor started, which
+is easy for a small model to fumble into the wrong move or into RUN. `use_move`
+takes a name or a 1-based number and writes the two cursor variables the game
+reads the instant A is pressed, so the choice is exact. It knows when to act
+from the game's own record of what each battler is waiting on: it presses only
+while `HandleInputChooseAction` or `HandleInputChooseMove` is live, so a press
+never leaks into a message still being read out. Then it plays the turn out,
+returning every line shown, and stops when the battle ends or it is your turn to
+choose again. It presses through acknowledgements with no text of their own, the
+level-up stat box in particular, which would otherwise hang the battle.
+
+**Reading, not mashing.** The text tools exist so the agent reads the game, not
+so it skips it: `advance_text` and `use_move` return every line they pass, and
+`observe` reports the current box. Forgiving input helps a small model stay in
+the loop rather than stall: `press` takes a single name or a list and accepts
+the compass words `move` uses for the d-pad, and a bad button or direction comes
+back naming the valid ones instead of a bare error code.
 
 ## Tests
 

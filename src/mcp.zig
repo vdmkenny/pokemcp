@@ -134,11 +134,13 @@ const tools = [_]Tool{
     .{
         .name = "press",
         .description =
-            \\Press buttons: a, b, start, select, up, down, left, right, l, r. Several
-            \\names at once are pressed together. Use this for menus, battles and
+            \\Press one or more buttons. Names: a, b, start, select, up, down,
+            \\left, right, l, r (north/south/east/west also work for the d-pad).
+            \\`buttons` may be a single name like "a", or a list like ["up","a"]
+            \\to press them together. Use this for menus, battles and
             \\confirmations; use `move` for walking, since it verifies the result.
         ,
-        .schema = "{\"type\":\"object\",\"properties\":{\"buttons\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":\"button names pressed together\"},\"repeat\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":64,\"default\":1},\"hold_frames\":{\"type\":\"integer\",\"default\":4},\"release_frames\":{\"type\":\"integer\",\"default\":12}},\"required\":[\"buttons\"]}",
+        .schema = "{\"type\":\"object\",\"properties\":{\"buttons\":{\"oneOf\":[{\"type\":\"string\"},{\"type\":\"array\",\"items\":{\"type\":\"string\"}}],\"description\":\"one button name, or a list pressed together: a, b, start, select, up, down, left, right, l, r\"},\"repeat\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":64,\"default\":1},\"hold_frames\":{\"type\":\"integer\",\"default\":4},\"release_frames\":{\"type\":\"integer\",\"default\":12}},\"required\":[\"buttons\"]}",
         .handler = toolPress,
     },
     .{
@@ -156,6 +158,19 @@ const tools = [_]Tool{
         ,
         .schema = "{\"type\":\"object\",\"properties\":{\"max_presses\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":200,\"default\":30}}}",
         .handler = toolAdvanceText,
+    },
+    .{
+        .name = "use_move",
+        .description =
+            \\In a battle, use one of your active Pokemon's moves by name (e.g.
+            \\"tackle", case-insensitive) or by 1-based number ("1" is the first
+            \\move). It selects FIGHT and the move for you, plays the turn out,
+            \\and returns every line shown plus whether the battle is still on.
+            \\Call it when the FIGHT/BAG/POKEMON/RUN menu is showing. See the move
+            \\names in `observe` or `party`. For BAG, POKEMON or RUN, use `press`.
+        ,
+        .schema = "{\"type\":\"object\",\"properties\":{\"move\":{\"type\":\"string\",\"description\":\"move name (case-insensitive) or 1-based number\"}},\"required\":[\"move\"]}",
+        .handler = toolUseMove,
     },
     .{
         .name = "party",
@@ -258,8 +273,18 @@ fn toolScreen(session: *Session, _: Args, gpa: Allocator, out: *Json) ToolError!
 }
 
 fn toolMove(session: *Session, args: Args, gpa: Allocator, out: *Json) ToolError!void {
-    const name = args.string("direction") orelse return error.BadArgument;
-    const dir = structs.Direction.parse(name) orelse return error.BadArgument;
+    const name = args.string("direction") orelse {
+        try out.write(.{ .moved = 0, .@"error" = "missing \"direction\": one of north, south, east, west (up/down/left/right also work)." });
+        return;
+    };
+    const dir = structs.Direction.parse(name) orelse {
+        try out.write(.{ .moved = 0, .@"error" = try std.fmt.allocPrint(
+            gpa,
+            "unknown direction \"{s}\": use north, south, east or west (up/down/left/right also work).",
+            .{name},
+        ) });
+        return;
+    };
     const steps = args.uint("steps", 1);
     const result = try session.game.move(gpa, dir, steps);
     try out.write(.{
@@ -272,17 +297,68 @@ fn toolMove(session: *Session, args: Args, gpa: Allocator, out: *Json) ToolError
     });
 }
 
-fn toolPress(session: *Session, args: Args, gpa: Allocator, out: *Json) ToolError!void {
-    const names = args.array("buttons") orelse return error.BadArgument;
-    var buttons: mgba.Buttons = .none;
-    for (names) |v| {
-        const s = switch (v) {
-            .string => |str| str,
-            else => return error.BadArgument,
+/// Valid button names, spelled out for error messages a small model can act on.
+const button_names = "a, b, start, select, up, down, left, right, l, r";
+
+/// One button token, tolerant of the compass words `move` uses for the d-pad.
+fn parseButtonToken(tok: []const u8) ?mgba.Buttons {
+    var buf: [8]u8 = undefined;
+    if (tok.len != 0 and tok.len <= buf.len) {
+        const lower = std.ascii.lowerString(buf[0..tok.len], tok);
+        const compass = [_][2][]const u8{
+            .{ "north", "up" },   .{ "south", "down" },
+            .{ "west", "left" },  .{ "east", "right" },
         };
-        buttons = buttons.unionWith(mgba.Buttons.parse(s) orelse return error.BadArgument);
+        for (compass) |c| if (std.mem.eql(u8, lower, c[0])) return mgba.Buttons.parse(c[1]);
     }
-    if (buttons.isEmpty()) return error.BadArgument;
+    return mgba.Buttons.parse(tok);
+}
+
+fn toolPress(session: *Session, args: Args, gpa: Allocator, out: *Json) ToolError!void {
+    // `buttons` may be a list ["up","a"] or a single string "a" (also split on
+    // spaces/commas/plus). Anything unparseable comes back as a plain-English
+    // error rather than a bare code, so a basic model can correct itself.
+    var buttons: mgba.Buttons = .none;
+    var saw_name = false;
+    if (args.array("buttons")) |names| {
+        for (names) |v| switch (v) {
+            .string => |str| {
+                saw_name = true;
+                buttons = buttons.unionWith(parseButtonToken(str) orelse {
+                    try out.write(.{ .pressed = false, .@"error" = try std.fmt.allocPrint(
+                        gpa,
+                        "unknown button \"{s}\". Valid names: {s}.",
+                        .{ str, button_names },
+                    ) });
+                    return;
+                });
+            },
+            else => {
+                try out.write(.{ .pressed = false, .@"error" = "each item in \"buttons\" must be a name string, e.g. [\"a\"] or [\"up\",\"a\"]." });
+                return;
+            },
+        };
+    } else if (args.string("buttons")) |str| {
+        var it = std.mem.tokenizeAny(u8, str, " ,+");
+        while (it.next()) |tok| {
+            saw_name = true;
+            buttons = buttons.unionWith(parseButtonToken(tok) orelse {
+                try out.write(.{ .pressed = false, .@"error" = try std.fmt.allocPrint(
+                    gpa,
+                    "unknown button \"{s}\". Valid names: {s}.",
+                    .{ tok, button_names },
+                ) });
+                return;
+            });
+        }
+    } else {
+        try out.write(.{ .pressed = false, .@"error" = "missing \"buttons\": give a name like \"a\" or a list like [\"up\",\"a\"]. Valid names: " ++ button_names ++ "." });
+        return;
+    }
+    if (!saw_name or buttons.isEmpty()) {
+        try out.write(.{ .pressed = false, .@"error" = "no button named. Valid names: " ++ button_names ++ "." });
+        return;
+    }
 
     const repeat = @min(args.uint("repeat", 1), 64);
     const hold = args.uint("hold_frames", 4);
@@ -317,6 +393,23 @@ fn toolAdvanceText(session: *Session, args: Args, gpa: Allocator, out: *Json) To
     try out.write(.{
         .messages = r.messages,
         .box_still_open = r.box_open,
+        .screen = try session.game.screen(gpa),
+    });
+}
+
+fn toolUseMove(session: *Session, args: Args, gpa: Allocator, out: *Json) ToolError!void {
+    const want = args.string("move") orelse {
+        try out.write(.{ .used = false, .@"error" = "missing \"move\": a move name like \"tackle\" or a 1-based number like \"1\"." });
+        return;
+    };
+    const r = try session.game.useMove(gpa, want);
+    try out.write(.{
+        .used = r.used,
+        .@"error" = r.@"error",
+        .messages = r.messages,
+        .in_battle = r.in_battle,
+        .battle = try session.game.battle(gpa),
+        .menu = try session.game.menu(gpa),
         .screen = try session.game.screen(gpa),
     });
 }
@@ -546,10 +639,10 @@ pub const Server = struct {
         } else if (std.mem.eql(u8, method, "tools/call")) {
             try self.callTool(arena, id, params);
         } else if (std.mem.eql(u8, method, "ping")) {
-            try self.beginResult(id);
-            try self.json().beginObject();
-            try self.json().endObject();
-            try self.endResult();
+            var js: Json = undefined;
+            try self.beginEnvelope(&js, id, "result");
+            try js.write(.{});
+            try self.endEnvelope(&js);
         } else if (is_notification) {
             // initialized, cancelled, and anything else we do not act on.
         } else {
@@ -557,22 +650,28 @@ pub const Server = struct {
         }
     }
 
-    var stringify_storage: Json = undefined;
-
-    fn json(self: *Server) *Json {
-        stringify_storage = .{ .writer = self.out, .options = .{} };
-        return &stringify_storage;
-    }
-
-    fn writeInitialize(self: *Server, arena: Allocator, id: std.json.Value) !void {
-        _ = arena;
-        var js: Json = .{ .writer = self.out, .options = .{} };
+    /// Every reply is the same envelope around one payload field, so open it
+    /// in one place and let each responder write only what is its own.
+    fn beginEnvelope(self: *Server, js: *Json, id: std.json.Value, field: []const u8) !void {
+        js.* = .{ .writer = self.out, .options = .{} };
         try js.beginObject();
         try js.objectField("jsonrpc");
         try js.write("2.0");
         try js.objectField("id");
         try js.write(id);
-        try js.objectField("result");
+        try js.objectField(field);
+    }
+
+    fn endEnvelope(self: *Server, js: *Json) !void {
+        try js.endObject();
+        try self.out.writeByte('\n');
+        try self.out.flush();
+    }
+
+    fn writeInitialize(self: *Server, arena: Allocator, id: std.json.Value) !void {
+        _ = arena;
+        var js: Json = undefined;
+        try self.beginEnvelope(&js, id, "result");
         try js.write(.{
             .protocolVersion = protocol_version,
             .capabilities = .{ .tools = .{ .listChanged = false } },
@@ -590,20 +689,13 @@ pub const Server = struct {
                 \\through conversations without losing what was said.
             ,
         });
-        try js.endObject();
-        try self.out.writeByte('\n');
-        try self.out.flush();
+        try self.endEnvelope(&js);
     }
 
     fn writeToolList(self: *Server, arena: Allocator, id: std.json.Value) !void {
         _ = arena;
-        var js: Json = .{ .writer = self.out, .options = .{} };
-        try js.beginObject();
-        try js.objectField("jsonrpc");
-        try js.write("2.0");
-        try js.objectField("id");
-        try js.write(id);
-        try js.objectField("result");
+        var js: Json = undefined;
+        try self.beginEnvelope(&js, id, "result");
         try js.beginObject();
         try js.objectField("tools");
         try js.beginArray();
@@ -622,9 +714,7 @@ pub const Server = struct {
         }
         try js.endArray();
         try js.endObject();
-        try js.endObject();
-        try self.out.writeByte('\n');
-        try self.out.flush();
+        try self.endEnvelope(&js);
     }
 
     fn callTool(self: *Server, arena: Allocator, id: std.json.Value, params: std.json.Value) !void {
@@ -659,13 +749,8 @@ pub const Server = struct {
         }
         if (!found) return self.writeError(arena, id, -32602, "unknown tool");
 
-        var js: Json = .{ .writer = self.out, .options = .{} };
-        try js.beginObject();
-        try js.objectField("jsonrpc");
-        try js.write("2.0");
-        try js.objectField("id");
-        try js.write(id);
-        try js.objectField("result");
+        var js: Json = undefined;
+        try self.beginEnvelope(&js, id, "result");
         try js.beginObject();
         try js.objectField("content");
         try js.beginArray();
@@ -685,9 +770,7 @@ pub const Server = struct {
             try js.write(true);
         }
         try js.endObject();
-        try js.endObject();
-        try self.out.writeByte('\n');
-        try self.out.flush();
+        try self.endEnvelope(&js);
     }
 
     fn writeError(
@@ -698,34 +781,10 @@ pub const Server = struct {
         message: []const u8,
     ) !void {
         _ = arena;
-        var js: Json = .{ .writer = self.out, .options = .{} };
-        try js.beginObject();
-        try js.objectField("jsonrpc");
-        try js.write("2.0");
-        try js.objectField("id");
-        try js.write(id);
-        try js.objectField("error");
+        var js: Json = undefined;
+        try self.beginEnvelope(&js, id, "error");
         try js.write(.{ .code = code, .message = message });
-        try js.endObject();
-        try self.out.writeByte('\n');
-        try self.out.flush();
-    }
-
-    fn beginResult(self: *Server, id: std.json.Value) !void {
-        var js: Json = .{ .writer = self.out, .options = .{} };
-        try js.beginObject();
-        try js.objectField("jsonrpc");
-        try js.write("2.0");
-        try js.objectField("id");
-        try js.write(id);
-        try js.objectField("result");
-    }
-
-    fn endResult(self: *Server) !void {
-        var js: Json = .{ .writer = self.out, .options = .{} };
-        try js.endObject();
-        try self.out.writeByte('\n');
-        try self.out.flush();
+        try self.endEnvelope(&js);
     }
 };
 

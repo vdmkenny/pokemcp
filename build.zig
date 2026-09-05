@@ -43,6 +43,23 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run.addArgs(args);
     b.step("run", "Run the MCP server").dependOn(&run.step);
 
+    // The player: a standalone client that drives the MCP server with an
+    // OpenRouter model and serves the live screen. It spawns the server binary
+    // rather than linking it, so it needs no mGBA.
+    const play = b.addExecutable(.{
+        .name = "pokemcp-play",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/play.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    b.installArtifact(play);
+    const play_run = b.addRunArtifact(play);
+    play_run.step.dependOn(b.getInstallStep());
+    if (b.args) |args| play_run.addArgs(args);
+    b.step("play", "Let an OpenRouter model play, and watch").dependOn(&play_run.step);
+
     // Extracts the symbol table, charmap and constant names from a built
     // pokefirered checkout. Its output is derived from the disassembly, so it
     // is generated locally and never committed.

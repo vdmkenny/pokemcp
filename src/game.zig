@@ -219,6 +219,36 @@ pub const Game = union(enum) {
         };
     }
 
+    pub fn inBattle(self: *Game) bool {
+        return switch (self.*) {
+            inline else => |*g| g.inBattle(),
+        };
+    }
+
+    fn setBattleAction(self: *Game, action: u8) void {
+        switch (self.*) {
+            inline else => |*g| g.setBattleAction(action),
+        }
+    }
+
+    fn setBattleMoveSlot(self: *Game, slot: u8) void {
+        switch (self.*) {
+            inline else => |*g| g.setBattleMoveSlot(slot),
+        }
+    }
+
+    fn battleAwaitingAction(self: *Game) bool {
+        return switch (self.*) {
+            inline else => |*g| g.battleAwaitingAction(),
+        };
+    }
+
+    fn battleAwaitingMove(self: *Game) bool {
+        return switch (self.*) {
+            inline else => |*g| g.battleAwaitingMove(),
+        };
+    }
+
     pub fn facing(self: *Game) Direction {
         return switch (self.*) {
             inline else => |*g| g.facing(),
@@ -400,24 +430,172 @@ pub const Game = union(enum) {
     /// and talk to whoever happened to be standing there.
     pub fn advanceText(self: *Game, gpa: Allocator, max_presses: u32) !TextResult {
         var seen: std.ArrayList([]const u8) = .empty;
-        if (try self.dialog(gpa) == null) {
+        // There is something to advance whenever a box is up OR a field script
+        // holds the controls. A script can park in `waitbuttonpress` with its
+        // message box already flag-hidden but the text still drawn and input
+        // locked -- a player presses A there to go on, and so must we. While
+        // input is locked A can only feed that script; it cannot walk into a
+        // sign or talk to an NPC, so pressing it is safe even through the
+        // scripted movement that a farewell like the rival's runs afterwards.
+        if (try self.dialog(gpa) == null and !self.inputLocked()) {
             return .{ .messages = &.{}, .box_open = false };
         }
 
         var i: u32 = 0;
         while (i < max_presses) : (i += 1) {
-            const d = try self.dialog(gpa);
-            if (d) |dd| {
-                const last = if (seen.items.len > 0) seen.items[seen.items.len - 1] else "";
-                if (dd.text.len != 0 and !std.mem.eql(u8, last, dd.text)) {
-                    try seen.append(gpa, dd.text);
-                }
-            } else break;
+            if (try self.dialog(gpa)) |dd| {
+                try appendMessage(gpa, &seen, dd.text);
+            } else if (!self.inputLocked()) {
+                // No box, and control has come back to the player: done.
+                break;
+            }
             self.press(.{ .a = true }, 4, 12);
         }
         return .{
             .messages = try seen.toOwnedSlice(gpa),
             .box_open = try self.dialog(gpa) != null,
+        };
+    }
+
+    pub const UseMoveResult = struct {
+        used: ?[]const u8 = null,
+        @"error": ?[]const u8 = null,
+        messages: []const []const u8 = &.{},
+        in_battle: bool = false,
+    };
+
+    /// Pick a move in battle by name or 1-based number, then play the turn out.
+    ///
+    /// By hand this means opening FIGHT and walking a 2x2 grid with no reliable
+    /// read of where the cursor began -- easy to fumble into the wrong move, or
+    /// into RUN. Instead this writes the two cursor variables the game consults
+    /// the instant A is pressed, so the choice is exact, then presses through
+    /// the turn's text and hands back what was said. Call it while the
+    /// FIGHT/BAG/POKEMON/RUN menu is showing.
+    pub fn useMove(self: *Game, gpa: Allocator, want: []const u8) !UseMoveResult {
+        if (!self.inBattle()) return .{ .@"error" = "not in a battle; nothing to attack" };
+        const m = try self.menu(gpa) orelse
+            return .{ .in_battle = true, .@"error" = "no battle menu is up yet; wait for your turn" };
+        if (!std.mem.eql(u8, m.kind, "battle_menu"))
+            return .{ .in_battle = true, .@"error" = "not the battle menu right now" };
+
+        // Resolve the request to a move slot: a 1-based number, or a name
+        // (case-insensitive). Anything else comes back with the known moves
+        // listed, so the caller can retry without guessing.
+        var slot: ?u8 = null;
+        if (std.fmt.parseInt(u32, want, 10) catch null) |n| {
+            if (n >= 1 and n <= m.moves.len) slot = @intCast(n - 1);
+        }
+        if (slot == null) for (m.moves, 0..) |mv, i| {
+            if (std.ascii.eqlIgnoreCase(mv.name, want)) {
+                slot = @intCast(i);
+                break;
+            }
+        };
+        const chosen = slot orelse {
+            var names: std.ArrayList([]const u8) = .empty;
+            for (m.moves) |mv| try names.append(gpa, mv.name);
+            return .{ .in_battle = true, .@"error" = try std.fmt.allocPrint(
+                gpa,
+                "no move '{s}'; you know: {s}",
+                .{ want, try std.mem.join(gpa, ", ", names.items) },
+            ) };
+        };
+        const move_name = m.moves[chosen].name;
+
+        var seen: std.ArrayList([]const u8) = .empty;
+
+        // Reach the action menu first, reading out any battle text on the way.
+        // The game tells us when a menu is genuinely taking input, so presses
+        // here only ever advance messages; the choice itself is made by writing
+        // the cursor, so nothing is selected while text is still on screen --
+        // the trap that eats a naive "just press A" during "Wild X appeared!".
+        if (!try self.reachBattlePrompt(gpa, &seen, .action))
+            return self.battleResult(gpa, null, &seen);
+
+        // FIGHT, wait for the move menu to take over, then the move. The game
+        // reads each cursor the instant A lands.
+        self.setBattleAction(0);
+        self.press(.{ .a = true }, 4, 12);
+        if (!try self.reachBattlePrompt(gpa, &seen, .move))
+            return self.battleResult(gpa, null, &seen);
+        self.setBattleMoveSlot(chosen);
+        self.press(.{ .a = true }, 4, 12);
+
+        // Play the turn out: read every line, and stop when the battle ends or
+        // it is our turn to choose again.
+        try self.playBattleTurn(gpa, &seen);
+        return self.battleResult(gpa, move_name, &seen);
+    }
+
+    const BattlePrompt = enum { action, move };
+
+    /// Advance battle text until the given menu is actually taking input.
+    /// Returns false if the battle ended, or the budget ran out, first.
+    fn reachBattlePrompt(
+        self: *Game,
+        gpa: Allocator,
+        seen: *std.ArrayList([]const u8),
+        which: BattlePrompt,
+    ) !bool {
+        var i: u32 = 0;
+        while (i < 240) : (i += 1) {
+            if (!self.inBattle()) return false;
+            const ready = switch (which) {
+                .action => self.battleAwaitingAction(),
+                .move => self.battleAwaitingMove(),
+            };
+            if (ready) return true;
+            try self.advanceBattleText(gpa, seen);
+        }
+        return false;
+    }
+
+    /// Read out a turn until the battle ends or the action menu comes back.
+    fn playBattleTurn(self: *Game, gpa: Allocator, seen: *std.ArrayList([]const u8)) !void {
+        var i: u32 = 0;
+        while (i < 400) : (i += 1) {
+            if (!self.inBattle() or self.battleAwaitingAction()) return;
+            try self.advanceBattleText(gpa, seen);
+        }
+    }
+
+    /// One step through a turn that is playing out: record any new line, then
+    /// press A to move things along.
+    ///
+    /// A is pressed whether or not there is readable text, because some prompts
+    /// that wait for the player show none -- the level-up stat box is the one
+    /// that hangs the whole battle if it is never answered. That is safe here:
+    /// the callers only run this while the battle is busy, never while a menu is
+    /// actually taking a choice (those are gated by the await checks), so the
+    /// press can only dismiss narration and acknowledgements, not pick an
+    /// option behind the agent's back. Pressing during an animation is a no-op.
+    fn advanceBattleText(self: *Game, gpa: Allocator, seen: *std.ArrayList([]const u8)) !void {
+        if (try self.dialog(gpa)) |d| try appendMessage(gpa, seen, d.text);
+        self.press(.{ .a = true }, 4, 12);
+    }
+
+    fn appendMessage(gpa: Allocator, seen: *std.ArrayList([]const u8), line: []const u8) !void {
+        const last = if (seen.items.len > 0) seen.items[seen.items.len - 1] else "";
+        if (line.len != 0 and !std.mem.eql(u8, last, line)) try seen.append(gpa, line);
+    }
+
+    fn battleResult(
+        self: *Game,
+        gpa: Allocator,
+        used: ?[]const u8,
+        seen: *std.ArrayList([]const u8),
+    ) !UseMoveResult {
+        return .{
+            .used = used,
+            .messages = try seen.toOwnedSlice(gpa),
+            .in_battle = self.inBattle(),
+            // A null move with the battle still running means we never reached
+            // the menu; if the battle ended, that is an outcome, not an error.
+            .@"error" = if (used == null and self.inBattle())
+                "could not reach the move menu; observe and try again"
+            else
+                null,
         };
     }
 

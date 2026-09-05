@@ -19,5 +19,9 @@
 *.ss[0-9]
 *.state
 
+# API keys and local settings for the player: never committed.
+.env
+*.env
+
 # macOS
 .DS_Store
