@@ -13,6 +13,7 @@ const obs = @import("observation.zig");
 const gamedata = @import("gamedata.zig");
 const structs = @import("games/structs.zig");
 const firered = @import("games/firered.zig");
+const memory = @import("memory.zig");
 
 const Allocator = std.mem.Allocator;
 pub const Direction = structs.Direction;
@@ -120,6 +121,52 @@ pub const Game = union(enum) {
         return switch (self.*) {
             .firered => firered.FireRed.legend,
         };
+    }
+    fn viewGlyphs(self: *Game, gpa: Allocator) ![]const u8 {
+        return switch (self.*) {
+            inline else => |*g| g.viewGlyphs(gpa),
+        };
+    }
+    fn mapSize(self: *Game) struct { w: u16, h: u16 } {
+        return switch (self.*) {
+            inline else => |*g| blk: {
+                const size = g.mapSize();
+                break :blk .{ .w = size.w, .h = size.h };
+            },
+        };
+    }
+
+    /// Commit what is on screen to memory. Cheap enough to do on every look.
+    pub fn recordSeen(self: *Game, gpa: Allocator, seen: *memory.Seen) !void {
+        const size = self.mapSize();
+        if (size.w == 0 or size.h == 0) return;
+        const w = self.where();
+        const k = memory.Seen.key(w.group, w.num);
+        const v = self.viewport();
+        const cells = try self.viewGlyphs(gpa);
+
+        var i: usize = 0;
+        var y: i16 = v.y0;
+        while (y <= v.y1) : (y += 1) {
+            var x: i16 = v.x0;
+            while (x <= v.x1) : (x += 1) {
+                defer i += 1;
+                switch (cells[i]) {
+                    // Nothing was seen there, the player is not scenery, and
+                    // people walk off: remembering any of these would leave the
+                    // map furnished with things that are no longer true.
+                    '?', '@', 'N' => {},
+                    else => |glyph| try seen.note(k, size.w, size.h, x, y, glyph),
+                }
+            }
+        }
+        try seen.noteVisit(k, size.w, size.h, w.x, w.y);
+    }
+
+    /// What is remembered of this map, drawn around the player.
+    pub fn remembered(self: *Game, gpa: Allocator, seen: *memory.Seen) !?[]const u8 {
+        const w = self.where();
+        return seen.render(gpa, memory.Seen.key(w.group, w.num), w.x, w.y, 22, 12);
     }
     pub fn tileAhead(self: *Game) ?obs.Tile {
         return switch (self.*) {
@@ -601,7 +648,7 @@ pub const Game = union(enum) {
 
     // -- the whole picture ---------------------------------------------------
 
-    pub fn observe(self: *Game, gpa: Allocator) !obs.Observation {
+    pub fn observe(self: *Game, gpa: Allocator, seen: ?*memory.Seen) !obs.Observation {
         const scr = try self.screen(gpa);
         return .{
             .frame = self.emulator().frame(),
@@ -625,6 +672,7 @@ pub const Game = union(enum) {
                     .npcs = try self.visibleNpcs(gpa),
                     .warps = try self.visibleWarps(gpa),
                     .signs = try self.visibleSigns(gpa),
+                    .remembered = if (seen) |sn| try self.remembered(gpa, sn) else null,
                 } } else .elsewhere,
                 else => .elsewhere,
             },

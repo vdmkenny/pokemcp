@@ -40,6 +40,11 @@ const system_prompt =
     \\  `observe` says the screen is anything other than `overworld`, you are not
     \\  outside yet: `press` "start" or "a" (and `advance_text` when someone is
     \\  talking) until you are. Walking will not work before then.
+    \\- You remember where you have been. `remembered` is everything you have
+    \\  already laid eyes on, drawn around you, with `,` marking ground you have
+    \\  already walked and blanks for places you have never seen. Use it: head
+    \\  for the blanks, not back over your own footprints. If you are stepping on
+    \\  `,` you are going back on yourself.
     \\- `observe` shows the 15x10 tiles around you, with you at the centre, plus
     \\  the people and doors in sight, any text on screen, and your party. You
     \\  cannot see past that, so travel the way a person does: look, walk a few

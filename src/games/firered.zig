@@ -601,6 +601,37 @@ pub const FireRed = struct {
         "N npc  D door/stairs  ? off-map";
 
     /// The 15x10 window the Game Boy draws, as ASCII with labelled axes.
+    /// How big the current map is, in tiles. Needed to remember it.
+    pub fn mapSize(self: *FireRed) struct { w: u16, h: u16 } {
+        const header = self.emu.readStruct(s.MapHeader, self.sym.map_header);
+        if (header.map_layout == 0) return .{ .w = 0, .h = 0 };
+        const layout = self.emu.readStruct(s.MapLayout, header.map_layout);
+        if (layout.width <= 0 or layout.height <= 0) return .{ .w = 0, .h = 0 };
+        return .{ .w = @intCast(@min(layout.width, 512)), .h = @intCast(@min(layout.height, 512)) };
+    }
+
+    /// The glyphs currently on screen, row by row from the viewport's origin.
+    /// Same characters `renderScreen` draws, without the labels, so what is
+    /// remembered is exactly what was shown.
+    pub fn viewGlyphs(self: *FireRed, gpa: Allocator) ![]const u8 {
+        const v = self.viewport();
+        const p = self.position();
+        const npcs = try self.visibleNpcs(gpa);
+        const warps = try self.visibleWarps(gpa);
+
+        const cells = try gpa.alloc(u8, @as(usize, view_w) * view_h);
+        var i: usize = 0;
+        var y = v.y0;
+        while (y <= v.y1) : (y += 1) {
+            var x = v.x0;
+            while (x <= v.x1) : (x += 1) {
+                cells[i] = self.glyphFor(x, y, p, npcs, warps);
+                i += 1;
+            }
+        }
+        return cells;
+    }
+
     pub fn renderScreen(self: *FireRed, gpa: Allocator) ![]const u8 {
         const v = self.viewport();
         const p = self.position();

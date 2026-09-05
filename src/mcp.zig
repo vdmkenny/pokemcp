@@ -10,6 +10,7 @@ const mgba = @import("mgba.zig");
 const game_mod = @import("game.zig");
 const gamedata = @import("gamedata.zig");
 const structs = @import("games/structs.zig");
+const memory = @import("memory.zig");
 
 const Allocator = std.mem.Allocator;
 const Game = game_mod.Game;
@@ -27,11 +28,25 @@ pub const Session = struct {
     data: *const gamedata.GameData,
     io: std.Io,
     states: [save_slots]?[]u8 = @splat(null),
+    /// What the player has seen. The viewport is a keyhole; without this the
+    /// agent has to rebuild the map from its own transcript every single turn.
+    seen: memory.Seen = undefined,
+
+    pub fn init(self: *Session) void {
+        self.seen = .{ .gpa = self.gpa };
+    }
 
     pub fn deinit(self: *Session) void {
         for (self.states) |maybe| {
             if (maybe) |blob| self.gpa.free(blob);
         }
+        self.seen.deinit();
+    }
+
+    /// Look, and remember having looked. Anything that shows the world calls
+    /// this first, so walking builds the map up as it goes.
+    fn look(self: *Session, gpa: Allocator) void {
+        self.game.recordSeen(gpa, &self.seen) catch {};
     }
 };
 
@@ -106,6 +121,10 @@ const tools = [_]Tool{
             \\
             \\Only what the Game Boy screen shows is reported. There is no world map
             \\and no path-finding: to cross a map, read the view, move, and read again.
+            \\
+            \\`remembered` is what you have already seen of this map, drawn around you:
+            \\blanks are places never looked at, and "," is ground you have walked. It
+            \\holds nothing you did not see for yourself.
         ,
         .schema = empty_schema,
         .handler = toolObserve,
@@ -246,7 +265,8 @@ const tools = [_]Tool{
 // -- tool implementations ----------------------------------------------------
 
 fn toolObserve(session: *Session, _: Args, gpa: Allocator, out: *Json) ToolError!void {
-    try out.write(try session.game.observe(gpa));
+    session.look(gpa);
+    try out.write(try session.game.observe(gpa, &session.seen));
 }
 
 fn toolScreen(session: *Session, _: Args, gpa: Allocator, out: *Json) ToolError!void {
@@ -260,6 +280,7 @@ fn toolScreen(session: *Session, _: Args, gpa: Allocator, out: *Json) ToolError!
         });
         return;
     }
+    session.look(gpa);
     try out.write(.{
         .mode = @tagName(scr.mode),
         .screen = scr,
@@ -269,6 +290,7 @@ fn toolScreen(session: *Session, _: Args, gpa: Allocator, out: *Json) ToolError!
         .legend = g.legend(),
         .tile_ahead = g.tileAhead(),
         .facing = g.facing().name(),
+        .remembered = try g.remembered(gpa, &session.seen),
     });
 }
 
@@ -300,6 +322,7 @@ fn toolMove(session: *Session, args: Args, gpa: Allocator, out: *Json) ToolError
     }
     const steps = args.uint("steps", 1);
     const result = try session.game.move(gpa, dir, steps);
+    session.look(gpa);
     try out.write(.{
         .moved = result.completed,
         .requested = result.requested,
@@ -307,6 +330,7 @@ fn toolMove(session: *Session, args: Args, gpa: Allocator, out: *Json) ToolError
         .blocked_by = result.blocked_by,
         .warped = result.warped,
         .view = try session.game.renderScreen(gpa),
+        .remembered = try session.game.remembered(gpa, &session.seen),
     });
 }
 

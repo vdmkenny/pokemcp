@@ -158,6 +158,7 @@ pub fn main(init: std.process.Init) !void {
         .data = &data,
         .io = io,
     };
+    session.init();
     defer session.deinit();
 
     var in_buf: [64 * 1024]u8 = undefined;
@@ -181,4 +182,5 @@ test {
     _ = @import("games/firered.zig");
     _ = @import("mcp.zig");
     _ = @import("stream.zig");
+    _ = @import("memory.zig");
 }

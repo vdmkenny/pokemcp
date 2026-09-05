@@ -136,6 +136,10 @@ pub const Overworld = struct {
     npcs: []const Npc,
     warps: []const Warp,
     signs: []const Sign,
+    /// Everything already seen on this map, drawn around the player. Only
+    /// tiles that have actually been in view appear; blanks are places never
+    /// looked at, and `,` is ground already walked.
+    remembered: ?[]const u8 = null,
 };
 
 pub const Battler = struct {
