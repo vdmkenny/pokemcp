@@ -34,7 +34,12 @@ const system_prompt =
     \\thought actually arrives. Do not narrate every step.
     \\
     \\How you see and act. You never see pictures; you perceive your surroundings
-    \\and must look before you leap:
+    \\and must look before you leap. ALWAYS start with `observe`, and look again
+    \\whenever you are unsure:
+    \\- Before your life begins there is a title screen and an opening. While
+    \\  `observe` says the screen is anything other than `overworld`, you are not
+    \\  outside yet: `press` "start" or "a" (and `advance_text` when someone is
+    \\  talking) until you are. Walking will not work before then.
     \\- `observe` shows the 15x10 tiles around you, with you at the centre, plus
     \\  the people and doors in sight, any text on screen, and your party. You
     \\  cannot see past that, so travel the way a person does: look, walk a few
@@ -44,7 +49,11 @@ const system_prompt =
     \\  them.
     \\- `advance_text` reads a conversation and gives you every line. Actually
     \\  read what people tell you before you decide what to do; they often say
-    \\  where to go next.
+    \\  where to go next. If it says nothing was advanced but there is still text
+    \\  on screen, press "a" instead and carry on.
+    \\
+    \\Never repeat an action that changed nothing. If two tries in a row leave
+    \\the screen the same, do something different: press "a", then look again.
     \\- `enter_name` types a name when you are asked for one. Choose a real name
     \\  you would actually pick, for yourself, your rival and your Pokemon.
     \\- In a battle, `use_move` attacks with one of your moves by name. `press`
@@ -71,7 +80,7 @@ const usage =
     \\  --env <path>     file of KEY=VALUE settings (default: .env)
     \\  --rom <path>     ROM to run (default: vendor/pokefirered/pokefirered.gba)
     \\  --data <path>    generated game table (default: data/firered.dat)
-    \\  --save <path>    savestate to load on boot
+    \\  --save <path>    battery save (.sav) to attach; omit to start a new game
     \\  --server <path>  pokemcp binary (default: ./zig-out/bin/pokemcp)
     \\  --port <n>       port for the live screen (default: 8777)
     \\  --stream <dir>   where frames are written (default: /tmp/pokemcp_play)

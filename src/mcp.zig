@@ -285,6 +285,19 @@ fn toolMove(session: *Session, args: Args, gpa: Allocator, out: *Json) ToolError
         ) });
         return;
     };
+    // Walking only means anything in the world. On a title screen, in an intro
+    // or in a menu the step would report a wall and an empty view, which reads
+    // as "there is a wall here" rather than "you are not there yet".
+    const scr = try session.game.screen(gpa);
+    if (scr.mode != .overworld) {
+        try out.write(.{ .moved = 0, .@"error" = try std.fmt.allocPrint(
+            gpa,
+            "you are not out in the world yet (screen: {s}). Use `press` with \"a\" or \"start\" " ++
+                "to get through the title screen, an intro or a menu; `observe` shows what is on screen.",
+            .{@tagName(scr.mode)},
+        ) });
+        return;
+    }
     const steps = args.uint("steps", 1);
     const result = try session.game.move(gpa, dir, steps);
     try out.write(.{
@@ -390,9 +403,18 @@ fn toolWait(session: *Session, args: Args, gpa: Allocator, out: *Json) ToolError
 fn toolAdvanceText(session: *Session, args: Args, gpa: Allocator, out: *Json) ToolError!void {
     const max = @min(args.uint("max_presses", 30), 200);
     const r = try session.game.advanceText(gpa, max);
+    // Screens outside the field -- the opening help pages, for one -- show text
+    // this cannot drive, and silently doing nothing invites a caller to ask
+    // again forever. Say so, and say what would work instead.
+    const nothing_happened = r.messages.len == 0 and !r.box_open;
     try out.write(.{
         .messages = r.messages,
         .box_still_open = r.box_open,
+        .hint = if (nothing_happened)
+            @as(?[]const u8, "no message box was open, so nothing was advanced. " ++
+                "If the screen still shows text or a NEXT marker, press \"a\" instead.")
+        else
+            null,
         .screen = try session.game.screen(gpa),
     });
 }
